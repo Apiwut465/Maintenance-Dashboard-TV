@@ -11,7 +11,7 @@ const SUPABASE_URL      = 'https://crigkewtzvslkpmsufxk.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNyaWdrZXd0enZzbGtwbXN1ZnhrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg0MDc5OTQsImV4cCI6MjA5Mzk4Mzk5NH0.G13M84Qz7mjLXuCtdCHe07BpP7feeBwVD4c2K4czot4';
 
 /* ---- Tunable constants ---- */
-const REFRESH_MS        = 15000;            // auto refresh every 15s
+const REFRESH_MS        = 100000;            // auto refresh every 15s
 const DEFAULT_PLANNED_MIN = 26 * 24 * 60;   // fallback planned time = 26d x 24h x 60m
 
 /* MTTR thresholds (minutes) */
@@ -31,12 +31,23 @@ let isOnline = false;
 const charts = {};               // chart instances by id
 let usingFallback = false;
 
+/* deck (page rotation) state */
+const PAGE_COUNT = 4;
+const PAGE_MS = 15000;           // seconds each page stays on screen
+let currentPage = 0;
+let pageTimer = null;
+let progressTimer = null;
+let isPaused = false;
+let progressStart = 0;
+
 /* ============================================================
    INIT
    ============================================================ */
 document.addEventListener('DOMContentLoaded', () => {
+  initTheme();
   startClock();
   bindUI();
+  initDeck();
   initSupabase();
   loadDashboard();                       // first load
   refreshTimer = setInterval(loadDashboard, REFRESH_MS);
@@ -96,6 +107,16 @@ function bindUI() {
     loadDashboard();
   });
 
+  // Theme toggle
+  document.getElementById('themeBtn').addEventListener('click', toggleTheme);
+
+  // Settings (technician photos)
+  document.getElementById('settingsBtn').addEventListener('click', openSettings);
+  document.getElementById('settingsClose').addEventListener('click', closeSettings);
+  document.getElementById('settingsModal').addEventListener('click', (e) => {
+    if (e.target.id === 'settingsModal') closeSettings();   // click backdrop to close
+  });
+
   // Fullscreen
   document.getElementById('fullscreenBtn').addEventListener('click', () => {
     if (!document.fullscreenElement) {
@@ -104,6 +125,230 @@ function bindUI() {
       document.exitFullscreen().catch(() => {});
     }
   });
+
+  // Deck dots — jump to a page
+  document.getElementById('deckDots').addEventListener('click', (e) => {
+    const dot = e.target.closest('.deck-dot');
+    if (!dot) return;
+    goToPage(Number(dot.dataset.go), true);
+  });
+
+  // Play / pause rotation
+  document.getElementById('playBtn').addEventListener('click', togglePause);
+
+  // Keyboard: ← → switch page, space = pause/play, F = fullscreen, T = theme
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { closeSettings(); return; }
+    // ignore deck shortcuts while the settings modal is open
+    if (!document.getElementById('settingsModal').hidden) return;
+    if (e.key === 'ArrowRight') goToPage((currentPage + 1) % PAGE_COUNT, true);
+    else if (e.key === 'ArrowLeft') goToPage((currentPage - 1 + PAGE_COUNT) % PAGE_COUNT, true);
+    else if (e.key === ' ') { e.preventDefault(); togglePause(); }
+    else if (e.key.toLowerCase() === 'f') document.getElementById('fullscreenBtn').click();
+    else if (e.key.toLowerCase() === 't') toggleTheme();
+  });
+}
+
+/* ============================================================
+   THEME (light / dark, remembered)
+   ============================================================ */
+function initTheme() {
+  // default dark; honour saved choice if present
+  let saved = 'dark';
+  try { saved = localStorage.getItem('mvr-theme') || 'dark'; } catch (e) {}
+  document.documentElement.setAttribute('data-theme', saved);
+}
+function toggleTheme() {
+  const cur = document.documentElement.getAttribute('data-theme');
+  const next = cur === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  try { localStorage.setItem('mvr-theme', next); } catch (e) {}
+  // recolour chart axes/grids for the new theme
+  refreshChartTheme();
+}
+
+/* ============================================================
+   SETTINGS — technician photo management
+   ============================================================ */
+const TECH_BUCKET = 'technician-photos';
+
+function openSettings() {
+  const modal = document.getElementById('settingsModal');
+  modal.hidden = false;
+  // pause rotation while managing settings
+  if (!isPaused) { clearInterval(pageTimer); clearInterval(progressTimer); }
+  loadTechManager();
+}
+function closeSettings() {
+  const modal = document.getElementById('settingsModal');
+  if (modal.hidden) return;
+  modal.hidden = true;
+  setSettingsNote('', null);
+  if (!isPaused) startPageTimer();        // resume rotation
+}
+
+function setSettingsNote(msg, kind) {
+  const note = document.getElementById('settingsNote');
+  if (!msg) { note.hidden = true; return; }
+  note.hidden = false;
+  note.textContent = msg;
+  note.className = 'modal__note' + (kind === 'error' ? ' is-error' : kind === 'ok' ? ' is-ok' : '');
+}
+
+/* Load the technician list into the manager grid */
+async function loadTechManager() {
+  const grid = document.getElementById('techManageGrid');
+
+  if (!sbClient) {
+    grid.innerHTML = '';
+    setSettingsNote('ยังไม่ได้เชื่อม Supabase — ใส่ URL และ Anon Key ใน app.js ก่อนจึงจะอัปโหลดรูปได้', 'error');
+    return;
+  }
+
+  grid.innerHTML = '<div class="state-empty" style="position:static">Loading technicians…</div>';
+  try {
+    const { data, error } = await sbClient
+      .from('technicians')
+      .select('id, employee_code, full_name, position, photo_url, is_active')
+      .order('full_name', { ascending: true });
+    if (error) throw error;
+
+    const techs = (data || []).filter(t => t.is_active !== false);
+    if (techs.length === 0) {
+      grid.innerHTML = '<div class="state-empty" style="position:static">No technicians found in the database.</div>';
+      return;
+    }
+
+    grid.innerHTML = techs.map(t => {
+      const hasPhoto = !!t.photo_url;
+      const avatar = hasPhoto
+        ? `<img class="tech-manage__avatar" src="${esc(t.photo_url)}" alt="">`
+        : `<span class="tech-manage__avatar">${esc(initials(t.full_name))}</span>`;
+      return `
+        <div class="tech-manage" data-tech-id="${esc(t.id)}">
+          ${avatar}
+          <div class="tech-manage__info">
+            <div class="tech-manage__name">${esc(t.full_name || '—')}</div>
+            <div class="tech-manage__code">${esc(t.employee_code || '')}${t.position ? ' · ' + esc(t.position) : ''}</div>
+            <button class="tech-manage__btn ${hasPhoto ? 'tech-manage__btn--has' : ''}" data-upload="${esc(t.id)}">
+              ${hasPhoto ? 'เปลี่ยนรูป' : 'อัปโหลดรูป'}
+            </button>
+          </div>
+          <input type="file" accept="image/*" data-file="${esc(t.id)}" hidden>
+        </div>`;
+    }).join('');
+
+    // wire up each upload button → hidden file input → upload handler
+    grid.querySelectorAll('[data-upload]').forEach(btn => {
+      const id = btn.getAttribute('data-upload');
+      const input = grid.querySelector(`[data-file="${id}"]`);
+      btn.addEventListener('click', () => input.click());
+      input.addEventListener('change', () => handlePhotoUpload(id, input.files[0], btn));
+    });
+
+  } catch (err) {
+    console.error('[MVR] loadTechManager failed:', err);
+    grid.innerHTML = '';
+    setSettingsNote('โหลดรายชื่อช่างไม่สำเร็จ: ' + (err.message || err), 'error');
+  }
+}
+
+/* Upload one photo: Storage → get public URL → save to technicians.photo_url */
+async function handlePhotoUpload(techId, file, btn) {
+  if (!file) return;
+  if (!file.type.startsWith('image/')) { setSettingsNote('ไฟล์ต้องเป็นรูปภาพเท่านั้น', 'error'); return; }
+  if (file.size > 5 * 1024 * 1024) { setSettingsNote('รูปใหญ่เกิน 5MB กรุณาเลือกรูปที่เล็กกว่านี้', 'error'); return; }
+
+  const original = btn.textContent;
+  btn.classList.add('is-busy');
+  btn.textContent = 'กำลังอัปโหลด…';
+  setSettingsNote('', null);
+
+  try {
+    // unique-ish path so the CDN doesn't serve a stale cached image
+    const ext = (file.name.split('.').pop() || 'jpg').toLowerCase();
+    const path = `${techId}-${Date.now()}.${ext}`;
+
+    // 1) upload to Storage bucket
+    const up = await sbClient.storage.from(TECH_BUCKET).upload(path, file, {
+      cacheControl: '3600', upsert: true, contentType: file.type
+    });
+    if (up.error) throw up.error;
+
+    // 2) public URL
+    const { data: pub } = sbClient.storage.from(TECH_BUCKET).getPublicUrl(path);
+    const photoUrl = pub.publicUrl;
+
+    // 3) save URL onto the technician row
+    const upd = await sbClient.from('technicians').update({ photo_url: photoUrl }).eq('id', techId);
+    if (upd.error) throw upd.error;
+
+    setSettingsNote('บันทึกรูปเรียบร้อย ✓', 'ok');
+    await loadTechManager();          // refresh the grid
+    loadDashboard();                  // refresh the live table so the new photo shows
+
+  } catch (err) {
+    console.error('[MVR] photo upload failed:', err);
+    btn.classList.remove('is-busy');
+    btn.textContent = original;
+    // common cause: bucket missing or policy not set
+    const hint = /bucket/i.test(err.message || '')
+      ? ' (ตรวจสอบว่าสร้าง bucket "technician-photos" และตั้ง policy แล้ว)' : '';
+    setSettingsNote('อัปโหลดไม่สำเร็จ: ' + (err.message || err) + hint, 'error');
+  }
+}
+
+/* ============================================================
+   DECK — rotating pages
+   ============================================================ */
+function initDeck() {
+  goToPage(0, false);
+  startPageTimer();
+}
+
+function goToPage(index, userInitiated) {
+  currentPage = index;
+  document.querySelectorAll('.page').forEach((p, i) => p.classList.toggle('is-active', i === index));
+  document.querySelectorAll('.deck-dot').forEach((d, i) => d.classList.toggle('is-active', i === index));
+
+  // Chart.js sizes to a hidden 0x0 canvas; when a page reveals, resize its charts
+  setTimeout(() => Object.values(charts).forEach(c => { try { c.resize(); } catch (e) {} }), 60);
+
+  // a manual jump restarts the dwell timer
+  if (userInitiated && !isPaused) startPageTimer();
+}
+
+function startPageTimer() {
+  clearInterval(pageTimer);
+  clearInterval(progressTimer);
+  if (isPaused) return;
+
+  progressStart = Date.now();
+  updateProgress();
+  progressTimer = setInterval(updateProgress, 200);
+
+  pageTimer = setInterval(() => {
+    goToPage((currentPage + 1) % PAGE_COUNT, false);
+    progressStart = Date.now();
+  }, PAGE_MS);
+}
+
+function updateProgress() {
+  const bar = document.querySelector('#deckProgress span');
+  if (!bar) return;
+  const pct = Math.min(100, ((Date.now() - progressStart) / PAGE_MS) * 100);
+  bar.style.width = pct + '%';
+}
+
+function togglePause() {
+  isPaused = !isPaused;
+  document.querySelector('.deck-nav').classList.toggle('is-paused', isPaused);
+  if (isPaused) {
+    clearInterval(pageTimer);
+    clearInterval(progressTimer);
+  } else {
+    startPageTimer();
+  }
 }
 
 /* ============================================================
@@ -178,22 +423,24 @@ async function fetchFromSupabase() {
   const { startISO } = getPeriodRange();
   const startDate = startISO.slice(0, 10);   // schema uses DATE columns, compare as YYYY-MM-DD
 
-  const [logsRes, machinesRes, plansRes, histRes] = await Promise.all([
+  const [logsRes, machinesRes, plansRes, histRes, techRes] = await Promise.all([
     sbClient.from('repair_logs').select('*').gte('repair_date', startDate).order('repair_date', { ascending: false }),
     sbClient.from('machines').select('*').eq('is_active', true),
     sbClient.from('pm_plans').select('*'),
-    sbClient.from('pm_history').select('*').gte('actual_date', startDate)
+    sbClient.from('pm_history').select('*').gte('actual_date', startDate),
+    sbClient.from('technicians').select('id, employee_code, full_name, position, photo_url, is_active')
   ]);
 
   // If a query errored, surface it so we drop to the catch / offline path
-  const firstErr = [logsRes, machinesRes, plansRes, histRes].find(r => r.error);
+  const firstErr = [logsRes, machinesRes, plansRes, histRes, techRes].find(r => r.error);
   if (firstErr) throw firstErr.error;
 
   return {
     logs:     logsRes.data     || [],
     machines: machinesRes.data || [],
     plans:    plansRes.data    || [],
-    history:  histRes.data     || []
+    history:  histRes.data     || [],
+    technicians: techRes.data  || []
   };
 }
 
@@ -201,12 +448,28 @@ async function fetchFromSupabase() {
    RENDER PIPELINE
    ============================================================ */
 function render(data) {
+  buildTechIndex(data.technicians);          // name/code → photo lookup
   const kpis = computeKpis(data);
   renderKpiCards(kpis, data);
   renderCharts(data);
   renderMachines(data.machines, data.logs);
   renderPm(data);
   renderLogs(data.logs);
+}
+
+/* technician lookup — keyed by both full_name and employee_code */
+let techIndex = {};
+function buildTechIndex(techs) {
+  techIndex = {};
+  (techs || []).forEach(t => {
+    if (t.full_name)     techIndex['name:' + t.full_name.trim()] = t;
+    if (t.employee_code) techIndex['code:' + t.employee_code.trim()] = t;
+  });
+}
+function findTech(name, code) {
+  if (code && techIndex['code:' + String(code).trim()]) return techIndex['code:' + String(code).trim()];
+  if (name && techIndex['name:' + String(name).trim()]) return techIndex['name:' + String(name).trim()];
+  return null;
 }
 
 /* ============================================================
@@ -327,11 +590,225 @@ function setKpiText(cardId, value, statusClass, foot) {
    CHARTS
    ============================================================ */
 const CHART_FONT = "'Sarabun', sans-serif";
-const GRID_COLOR = 'rgba(255,255,255,0.06)';
-const TICK_COLOR = '#7488a6';
+
+/* read live theme colors from CSS variables */
+function cssVar(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+function gridColor() { return cssVar('--grid-line') || 'rgba(255,255,255,0.06)'; }
+function tickColor() { return cssVar('--text-dim') || '#7488a6'; }
+function accentColor() { return cssVar('--accent') || '#4f93d6'; }
 
 Chart.defaults.font.family = CHART_FONT;
-Chart.defaults.color = TICK_COLOR;
+
+
+/* ------------------------------------------------------------
+   Always-visible chart labels
+   - Shows KPI values directly on charts, so TV/kiosk users do not need hover tooltips.
+   - No external ChartDataLabels plugin required.
+   ------------------------------------------------------------ */
+function isLightTheme() { return document.documentElement.getAttribute('data-theme') === 'light'; }
+function chartLabelTextColor()  { return isLightTheme() ? '#23324a' : '#eef3fb'; }
+function chartLabelBgColor()    { return isLightTheme() ? 'rgba(255, 255, 255, 0.92)' : 'rgba(24, 37, 57, 0.90)'; }
+function chartLabelBorderColor(){ return isLightTheme() ? 'rgba(24, 35, 58, 0.08)' : 'rgba(255, 255, 255, 0.08)'; }
+function chartLabelShadowColor(){ return isLightTheme() ? 'rgba(15, 23, 42, 0.10)' : 'rgba(0, 0, 0, 0.24)'; }
+
+function toLabelLines(value) {
+  if (Array.isArray(value)) return value.map(v => String(v));
+  return String(value).split('\n');
+}
+
+function drawRoundRect(ctx, x, y, w, h, r) {
+  const radius = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + radius, y);
+  ctx.lineTo(x + w - radius, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + radius);
+  ctx.lineTo(x + w, y + h - radius);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - radius, y + h);
+  ctx.lineTo(x + radius, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - radius);
+  ctx.lineTo(x, y + radius);
+  ctx.quadraticCurveTo(x, y, x + radius, y);
+  ctx.closePath();
+}
+
+function drawLabelBox(ctx, label, x, y, opt = {}) {
+  const lines = toLabelLines(label).filter(Boolean);
+  if (!lines.length) return;
+
+  const fontSize = opt.fontSize || 10.5;
+  const fontWeight = opt.fontWeight || 600;
+  const lineHeight = Math.round(fontSize * 1.16);
+  const padX = opt.paddingX ?? 7;
+  const padY = opt.paddingY ?? 3;
+  const radius = opt.radius ?? 8;
+  const align = opt.align || 'center';
+  const baseline = opt.baseline || 'middle';
+  const chartArea = opt.chartArea;
+
+  ctx.save();
+  ctx.font = `${fontWeight} ${fontSize}px Sarabun, sans-serif`;
+  const textW = Math.max(...lines.map(t => ctx.measureText(t).width));
+  const boxW = Math.ceil(textW + padX * 2);
+  const boxH = Math.ceil((lines.length * lineHeight) + padY * 2);
+
+  let left = align === 'left' ? x : align === 'right' ? x - boxW : x - boxW / 2;
+  let top  = baseline === 'top' ? y : baseline === 'bottom' ? y - boxH : y - boxH / 2;
+
+  // Keep labels inside the chart area, preventing cut-off at panel edges.
+  if (chartArea) {
+    const margin = 2;
+    left = Math.max(chartArea.left + margin, Math.min(left, chartArea.right - boxW - margin));
+    top  = Math.max(chartArea.top + margin,  Math.min(top,  chartArea.bottom - boxH - margin));
+  }
+
+  const plain = opt.plain !== false;
+
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = opt.color || chartLabelTextColor();
+
+  if (!plain) {
+    ctx.fillStyle = opt.backgroundColor || chartLabelBgColor();
+    ctx.strokeStyle = opt.borderColor || chartLabelBorderColor();
+    ctx.lineWidth = 1;
+    ctx.shadowColor = opt.shadowColor || chartLabelShadowColor();
+    ctx.shadowBlur = opt.shadowBlur ?? 10;
+    ctx.shadowOffsetX = 0;
+    ctx.shadowOffsetY = 2;
+    drawRoundRect(ctx, left, top, boxW, boxH, radius);
+    ctx.fill();
+    ctx.shadowColor = 'transparent';
+    ctx.shadowBlur = 0;
+    ctx.stroke();
+  }
+
+  lines.forEach((line, i) => {
+    const ty = top + padY + (i * lineHeight) + lineHeight / 2;
+    ctx.fillText(line, left + boxW / 2, ty);
+  });
+  ctx.restore();
+}
+
+function defaultChartLabelFormatter(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? fmtNum(n) : String(value ?? '');
+}
+
+function drawDoughnutValueLabels(chart, opts) {
+  const ctx = chart.ctx;
+  const dataset = chart.data.datasets[0] || {};
+  const values = (dataset.data || []).map(v => Number(v) || 0);
+  const total = values.reduce((s, n) => s + n, 0) || 1;
+  const meta = chart.getDatasetMeta(0);
+
+  meta.data.forEach((arc, index) => {
+    const value = values[index];
+    if (!value) return;
+
+    const p = arc.getProps(['x', 'y', 'startAngle', 'endAngle', 'innerRadius', 'outerRadius'], true);
+    const angle = (p.startAngle + p.endAngle) / 2;
+    const radius = p.innerRadius + ((p.outerRadius - p.innerRadius) * 0.56);
+    const x = p.x + Math.cos(angle) * radius;
+    const y = p.y + Math.sin(angle) * radius;
+    const label = opts.formatter
+      ? opts.formatter(value, { chart, dataset, datasetIndex: 0, dataIndex: index })
+      : `${fmtNum((value / total) * 100, 0)}%`;
+
+    drawLabelBox(ctx, label, x, y, {
+      chartArea: chart.chartArea,
+      fontSize: opts.fontSize || 11,
+      fontWeight: opts.fontWeight || 600,
+      color: opts.color,
+      paddingX: opts.paddingX ?? 6,
+      paddingY: opts.paddingY ?? 4,
+      radius: opts.radius ?? 7,
+      plain: opts.plain !== false
+    });
+  });
+}
+
+function labelPositionForElement(chart, element, dataset, dsType) {
+  const indexAxis = chart.options.indexAxis || 'x';
+  const pos = element.tooltipPosition ? element.tooltipPosition() : { x: element.x, y: element.y };
+
+  if (dsType === 'bar') {
+    if (indexAxis === 'y') {
+      return { x: element.x + 8, y: element.y, align: 'left', baseline: 'middle' };
+    }
+    return { x: element.x, y: element.y - 8, align: 'center', baseline: 'bottom' };
+  }
+
+  // line / point labels
+  return { x: pos.x, y: pos.y - 10, align: 'center', baseline: 'bottom' };
+}
+
+const CHART_VALUE_LABEL_PLUGIN = {
+  id: 'alwaysValueLabels',
+  afterDatasetsDraw(chart, args, pluginOptions) {
+    const opts = pluginOptions || {};
+    if (opts.enabled === false) return;
+
+    const chartType = chart.config.type;
+    if (chartType === 'doughnut' || chartType === 'pie') {
+      drawDoughnutValueLabels(chart, opts);
+      return;
+    }
+
+    const ctx = chart.ctx;
+    chart.data.datasets.forEach((dataset, datasetIndex) => {
+      const meta = chart.getDatasetMeta(datasetIndex);
+      if (!meta || meta.hidden) return;
+
+      const dsType = dataset.type || chartType;
+      const values = dataset.data || [];
+      meta.data.forEach((element, dataIndex) => {
+        const raw = values[dataIndex];
+        const value = Number(raw);
+        if (!Number.isFinite(value)) return;
+        if (opts.hideZero && value === 0) return;
+
+        const label = opts.formatter
+          ? opts.formatter(raw, { chart, dataset, datasetIndex, dataIndex })
+          : defaultChartLabelFormatter(raw);
+        if (!label) return;
+
+        const p = labelPositionForElement(chart, element, dataset, dsType);
+        drawLabelBox(ctx, label, p.x, p.y, {
+          chartArea: chart.chartArea,
+          align: p.align,
+          baseline: p.baseline,
+          fontSize: opts.fontSize || 11,
+          fontWeight: opts.fontWeight || 600,
+          color: opts.color,
+          paddingX: opts.paddingX ?? 6,
+          paddingY: opts.paddingY ?? 4,
+          radius: opts.radius ?? 6,
+          plain: opts.plain !== false
+        });
+      });
+    });
+  }
+};
+
+Chart.register(CHART_VALUE_LABEL_PLUGIN);
+
+/* re-apply theme colors to existing charts (called on theme switch) */
+function refreshChartTheme() {
+  Object.values(charts).forEach(c => {
+    try {
+      const s = c.options.scales || {};
+      Object.values(s).forEach(axis => {
+        if (axis.grid) axis.grid.color = gridColor();
+        if (axis.ticks && axis.ticks.color && axis.ticks.color !== accentColor()) axis.ticks.color = tickColor();
+      });
+      if (c.options.plugins && c.options.plugins.legend && c.options.plugins.legend.labels)
+        c.options.plugins.legend.labels.color = cssVar('--text-mid');
+      c.update('none');
+    } catch (e) {}
+  });
+}
 
 function renderCharts(data) {
   renderDowntimeTrend(data.logs);
@@ -364,16 +841,23 @@ function renderDowntimeTrend(logs) {
       labels: labels.map(fmtShortDate),
       datasets: [{
         data: values,
-        borderColor: '#4f93d6',
-        backgroundColor: 'rgba(79,147,214,0.15)',
+        borderColor: accentColor(),
+        backgroundColor: cssVar('--accent-soft') || 'rgba(79,147,214,0.15)',
         fill: true,
         tension: 0.32,
-        pointRadius: 3,
-        pointBackgroundColor: '#4f93d6',
+        pointRadius: 4,
+        pointHoverRadius: 5,
+        pointBackgroundColor: accentColor(),
         borderWidth: 2
       }]
     },
-    options: baseLineOptions()
+    options: baseLineOptions({
+      enabled: true,
+      formatter: value => fmtNum(value),
+      fontSize: 10.5,
+      fontWeight: 600,
+      hideZero: true
+    })
   });
 }
 
@@ -388,14 +872,20 @@ function renderTopLoss(logs) {
       labels: top.map(t => t.name),
       datasets: [{
         data: top.map(t => t.total),
-        backgroundColor: '#4f93d6',
+        backgroundColor: accentColor(),
         borderRadius: 5,
         barThickness: 22
       }]
     },
     options: {
       indexAxis: 'y',
-      ...baseBarOptions()
+      ...baseBarOptions({
+        enabled: true,
+        formatter: value => fmtNum(value),
+        fontSize: 10.5,
+        fontWeight: 600,
+        hideZero: true
+      })
     }
   });
 }
@@ -418,20 +908,27 @@ function renderPareto(logs) {
   const cumulative = counts.map(n => { run += n; return Math.round((run / total) * 100); });
 
   drawChart('chartPareto', {
+    type: 'bar',
     data: {
       labels,
       datasets: [
         { type: 'bar', data: counts, backgroundColor: '#3f6fa5', borderRadius: 5, order: 2,
           yAxisID: 'y' },
         { type: 'line', data: cumulative, borderColor: '#e6b54a', backgroundColor: '#e6b54a',
-          borderWidth: 2, pointRadius: 3, tension: 0.25, order: 1, yAxisID: 'y1' }
+          borderWidth: 2, pointRadius: 4, pointHoverRadius: 5, tension: 0.25, order: 1, yAxisID: 'y1' }
       ]
     },
     options: {
-      ...baseBarOptions(),
+      ...baseBarOptions({
+        enabled: true,
+        formatter: (value, ctx) => ctx.dataset.yAxisID === 'y1' ? `${fmtNum(value)}%` : fmtNum(value),
+        fontSize: 10,
+        fontWeight: 600,
+        hideZero: true
+      }),
       scales: {
-        x: { grid: { display: false }, ticks: { color: TICK_COLOR, font: { size: 10 } } },
-        y: { beginAtZero: true, grid: { color: GRID_COLOR }, ticks: { color: TICK_COLOR, precision: 0 } },
+        x: { grid: { display: false }, ticks: { color: tickColor(), font: { size: 10 } } },
+        y: { beginAtZero: true, grid: { color: gridColor() }, ticks: { color: tickColor(), precision: 0 } },
         y1: { beginAtZero: true, max: 100, position: 'right',
               grid: { drawOnChartArea: false },
               ticks: { color: '#e6b54a', callback: v => v + '%' } }
@@ -457,36 +954,60 @@ function renderBreakdown(logs) {
     type: 'doughnut',
     data: {
       labels,
-      datasets: [{ data: values, backgroundColor: palette, borderColor: '#182539', borderWidth: 2 }]
+      datasets: [{ data: values, backgroundColor: palette, borderColor: cssVar('--surface'), borderWidth: 2 }]
     },
     options: {
       responsive: true, maintainAspectRatio: false,
       cutout: '62%',
+      layout: { padding: 12 },
       plugins: {
-        legend: { position: 'right', labels: { color: '#aebcd2', font: { size: 11 }, boxWidth: 12, padding: 10 } }
+        legend: { position: 'right', labels: { color: cssVar('--text-mid'), font: { size: 11 }, boxWidth: 12, padding: 10 } },
+        tooltip: { enabled: true },
+        alwaysValueLabels: {
+          enabled: true,
+          formatter: (value, ctx) => {
+            const data = ctx.chart.data.datasets[0].data.map(v => Number(v) || 0);
+            const total = data.reduce((s, n) => s + n, 0) || 1;
+            const pct = (Number(value) / total) * 100;
+            return `${fmtNum(pct, 0)}%`;
+          },
+          color: '#ffffff',
+          fontSize: 10,
+          fontWeight: 600
+        }
       }
     }
   });
 }
 
 /* shared option builders */
-function baseLineOptions() {
+function baseLineOptions(labelOptions = { enabled: false }) {
   return {
     responsive: true, maintainAspectRatio: false,
-    plugins: { legend: { display: false } },
+    layout: { padding: { top: 28, right: 22, bottom: 4, left: 4 } },
+    plugins: {
+      legend: { display: false },
+      tooltip: { enabled: true },
+      alwaysValueLabels: labelOptions
+    },
     scales: {
-      x: { grid: { display: false }, ticks: { color: TICK_COLOR, font: { size: 10 }, maxRotation: 0, autoSkip: true } },
-      y: { beginAtZero: true, grid: { color: GRID_COLOR }, ticks: { color: TICK_COLOR } }
+      x: { grid: { display: false }, ticks: { color: tickColor(), font: { size: 10 }, maxRotation: 0, autoSkip: true } },
+      y: { beginAtZero: true, grid: { color: gridColor() }, ticks: { color: tickColor() } }
     }
   };
 }
-function baseBarOptions() {
+function baseBarOptions(labelOptions = { enabled: false }) {
   return {
     responsive: true, maintainAspectRatio: false,
-    plugins: { legend: { display: false } },
+    layout: { padding: { top: 24, right: 38, bottom: 4, left: 4 } },
+    plugins: {
+      legend: { display: false },
+      tooltip: { enabled: true },
+      alwaysValueLabels: labelOptions
+    },
     scales: {
-      x: { beginAtZero: true, grid: { color: GRID_COLOR }, ticks: { color: TICK_COLOR } },
-      y: { grid: { display: false }, ticks: { color: TICK_COLOR, font: { size: 11 } } }
+      x: { beginAtZero: true, grid: { color: gridColor() }, ticks: { color: tickColor() } },
+      y: { grid: { display: false }, ticks: { color: tickColor(), font: { size: 11 } } }
     }
   };
 }
@@ -511,72 +1032,54 @@ function renderMachines(machines, logs) {
   const grid = document.getElementById('machineGrid');
   const empty = document.getElementById('machineEmpty');
 
-  if (!machines || machines.length === 0) {
+  // Aggregate per machine across the whole period (this is historical, not real-time).
+  // Keyed by machine_no so it stays stable.
+  const agg = new Map();
+  (logs || []).forEach(r => {
+    const key = r.machine_no || r.machine_name;
+    if (!key) return;
+    let m = agg.get(key);
+    if (!m) {
+      m = { name: r.machine_name || key, no: r.machine_no || '', line: r.production_line || '—',
+            loss: 0, jobs: 0, lastDate: '', lastProblem: '—' };
+      agg.set(key, m);
+    }
+    m.loss += lossOf(r);
+    m.jobs += 1;
+    const d = (r.repair_date || '').slice(0, 10);
+    if (d > m.lastDate) { m.lastDate = d; m.lastProblem = r.problem_name || '—'; }
+  });
+
+  // Only show machines that actually had repairs this period, worst loss first
+  const rows = [...agg.values()].sort((a, b) => b.loss - a.loss);
+
+  if (rows.length === 0) {
     grid.innerHTML = '';
     empty.hidden = false;
     return;
   }
   empty.hidden = true;
 
-  const today = new Date().toISOString().slice(0, 10);
+  // Color band by share of the top machine's loss (relative severity)
+  const maxLoss = rows[0].loss || 1;
 
-  // Build per-machine view from repair_logs (machines table has no live status column,
-  // so current status is derived from the latest log).
-  const todayLoss = new Map();    // machine_no -> today's downtime
-  const latestLog = new Map();    // machine_no -> most recent log row
-
-  (logs || []).forEach(r => {
-    const key = r.machine_no || r.machine_name;
-    if ((r.repair_date || '').slice(0, 10) === today) {
-      todayLoss.set(key, (todayLoss.get(key) || 0) + lossOf(r));
-    }
-    // logs arrive newest-first, so first seen = latest
-    if (!latestLog.has(key)) latestLog.set(key, r);
-  });
-
-  grid.innerHTML = machines.map(m => {
-    const key = m.machine_no || m.machine_name;
-    const name = m.machine_name || 'Machine';
-    const last = latestLog.get(key);
-    const sev = deriveMachineStatus(last, today);
-    const dt = todayLoss.get(key) || 0;
-    const prob = last ? (last.problem_name || '—') : 'No recent issue';
-    const severity = last ? (last.severity || sev.label) : '—';
-
+  grid.innerHTML = rows.map(m => {
+    const ratio = m.loss / maxLoss;
+    const cls = ratio >= 0.66 ? 's-red' : (ratio >= 0.33 ? 's-yellow' : 's-green');
     return `
-      <div class="machine ${sev.cls}">
+      <div class="machine ${cls}">
         <div class="machine__top">
           <div>
-            <div class="machine__name">${esc(name)}</div>
-            <div class="machine__no">${esc(m.machine_no || '')}</div>
+            <div class="machine__no-lead">${esc(m.no || m.name)}</div>
+            <div class="machine__name-sub">${esc(m.name)} · ${esc(m.line)}</div>
           </div>
-          <span class="machine__badge">${esc(sev.label)}</span>
+          <span class="machine__badge">${fmtNum(m.loss)}<small> min</small></span>
         </div>
-        <div class="machine__row"><span>Line</span><span>${esc(m.production_line || '—')}</span></div>
-        <div class="machine__row"><span>Today DT</span><span>${fmtNum(dt)} min</span></div>
-        <div class="machine__row"><span>Last problem</span><span>${esc(prob)}</span></div>
-        <div class="machine__row"><span>Severity</span><span>${esc(severity)}</span></div>
+        <div class="machine__row"><span>Breakdowns</span><span>${fmtNum(m.jobs)} ครั้ง</span></div>
+        <div class="machine__row"><span>Last repair</span><span>${esc(fmtShortDate(m.lastDate))}</span></div>
+        <div class="machine__row"><span>Last problem</span><span>${esc(m.lastProblem)}</span></div>
       </div>`;
   }).join('');
-}
-
-/* Derive a live status from the latest repair log of a machine */
-function deriveMachineStatus(lastLog, today) {
-  if (!lastLog) return { cls: 's-green', label: 'Running' };
-
-  const isToday = (lastLog.repair_date || '').slice(0, 10) === today;
-  const open = !isStatusDone(lastLog.status);
-  const sev = String(lastLog.severity || '').toLowerCase();
-
-  // Open job today → currently down / under repair
-  if (open && isToday) return { cls: 's-red', label: 'Stop/Repair' };
-  // High-severity issue logged today but closed → keep an eye (Warning)
-  if (isToday && (sev.includes('high') || sev.includes('critical') || sev.includes('สูง')))
-    return { cls: 's-yellow', label: 'Warning' };
-  // Any still-open job (not today) → Warning
-  if (open) return { cls: 's-yellow', label: 'Warning' };
-
-  return { cls: 's-green', label: 'Running' };
 }
 
 /* ============================================================
@@ -611,6 +1114,111 @@ function renderPm(data) {
   fill.style.strokeDashoffset = C - (C * pct) / 100;
   fill.style.stroke = pct >= 80 ? 'var(--green)' : (pct >= 70 ? 'var(--yellow)' : 'var(--red)');
   document.getElementById('pmRingPct').textContent = pct + '%';
+
+  renderPmPlanTable(plans);
+  renderPmFindingTable(hist);
+}
+
+/* Upcoming & overdue PM plans — overdue first, then soonest due */
+function renderPmPlanTable(plans) {
+  const body = document.getElementById('pmPlanBody');
+  const empty = document.getElementById('pmPlanEmpty');
+  if (!body) return;
+
+  // Show only plans that are not yet completed/cancelled
+  const active = plans.filter(p => p.status !== 'Completed' && p.status !== 'Cancelled');
+
+  const rank = { 'Overdue': 0, 'In Progress': 1, 'Pending': 2 };
+  active.sort((a, b) => {
+    const ra = rank[a.status] ?? 3, rb = rank[b.status] ?? 3;
+    if (ra !== rb) return ra - rb;
+    const da = a.next_due_date || a.planned_date || '';
+    const db = b.next_due_date || b.planned_date || '';
+    return da.localeCompare(db);
+  });
+
+  if (active.length === 0) {
+    body.innerHTML = '';
+    empty.hidden = false;
+    return;
+  }
+  empty.hidden = true;
+
+  body.innerHTML = active.slice(0, 12).map(p => {
+    const due = p.next_due_date || p.planned_date || '';
+    const isOver = p.status === 'Overdue' || isPmOverdue(p);
+    const dueCls = isOver ? 'pm-due-over' : (isDueSoon(due) ? 'pm-due-soon' : '');
+    return `
+      <tr>
+        <td class="pm-cell-strong">${esc(p.machine_no || p.machine_name || '—')}</td>
+        <td>${esc(p.pm_title || '—')}</td>
+        <td>${esc(p.pm_type || '—')}</td>
+        <td class="${dueCls}">${esc(fmtShortDate((due || '').slice(0,10)))}</td>
+        <td>${pmStatusPill(p.status)}</td>
+      </tr>`;
+  }).join('');
+}
+
+/* PM findings — abnormalities / follow-ups first */
+function renderPmFindingTable(hist) {
+  const body = document.getElementById('pmFindingBody');
+  const empty = document.getElementById('pmFindingEmpty');
+  if (!body) return;
+
+  // Surface anything that isn't a clean "Normal/Completed" pass
+  const flagged = hist.filter(h =>
+    h.result === 'Abnormal Found' ||
+    h.result === 'Need Follow-up' ||
+    h.result === 'Temporary Fixed' ||
+    h.result === 'Need Spare Part' ||
+    truthy(h.follow_up_required)
+  );
+
+  flagged.sort((a, b) => (b.actual_date || '').localeCompare(a.actual_date || ''));
+
+  if (flagged.length === 0) {
+    body.innerHTML = '';
+    empty.hidden = false;
+    return;
+  }
+  empty.hidden = true;
+
+  body.innerHTML = flagged.slice(0, 10).map(h => `
+    <tr>
+      <td>${esc(fmtShortDate((h.actual_date || '').slice(0,10)))}</td>
+      <td class="pm-cell-strong">${esc(h.machine_no || h.machine_name || '—')}</td>
+      <td>${esc(h.pm_title || '—')}</td>
+      <td>${pmResultPill(h.result)}</td>
+      <td class="pm-muted" title="${esc(h.finding || '')}">${esc(h.finding || h.abnormal_detail || '—')}</td>
+      <td class="pm-muted" title="${esc(h.action_taken || '')}">${esc(h.action_taken || '—')}</td>
+      <td>${esc(h.technician_name || '—')}</td>
+    </tr>`).join('');
+}
+
+function isDueSoon(dateStr) {
+  if (!dateStr) return false;
+  const due = new Date(dateStr);
+  if (isNaN(due)) return false;
+  const days = (due - new Date()) / 86400000;
+  return days >= 0 && days <= 7;       // within a week
+}
+
+function pmStatusPill(status) {
+  const s = String(status || '');
+  if (s === 'Overdue')     return `<span class="pill pill--open">Overdue</span>`;
+  if (s === 'In Progress') return `<span class="pill pill--prog">In Progress</span>`;
+  if (s === 'Pending')     return `<span class="pill pill--neutral">Pending</span>`;
+  if (s === 'Completed')   return `<span class="pill pill--done">Completed</span>`;
+  return `<span class="pill pill--neutral">${esc(s || '—')}</span>`;
+}
+
+function pmResultPill(result) {
+  const s = String(result || '');
+  if (s === 'Abnormal Found')  return `<span class="pill pill--open">Abnormal</span>`;
+  if (s === 'Need Follow-up')  return `<span class="pill pill--prog">Follow-up</span>`;
+  if (s === 'Need Spare Part') return `<span class="pill pill--prog">Spare Part</span>`;
+  if (s === 'Temporary Fixed') return `<span class="pill pill--prog">Temp Fix</span>`;
+  return `<span class="pill pill--neutral">${esc(s || '—')}</span>`;
 }
 
 function isPmOverdue(p) {
@@ -651,11 +1259,32 @@ function renderLogs(logs) {
         <td>${esc(r.cause_name || '—')}</td>
         <td>${esc(r.action_name || '—')}</td>
         <td class="num">${fmtNum(loss)}</td>
-        <td>${esc(r.technician_name || '—')}</td>
+        <td>${techCell(r.technician_name, r.technician_code)}</td>
         <td>${statusPill(r.status)}</td>
       </tr>`;
   }).join('');
   body.innerHTML = rows;
+}
+
+/* render a technician as avatar (photo or initials) + name */
+function techCell(name, code) {
+  const display = name || '—';
+  if (display === '—') return '<span class="tech-cell"><span class="tech-avatar tech-avatar--empty">?</span><span>—</span></span>';
+  const t = findTech(name, code);
+  const avatar = (t && t.photo_url)
+    ? `<img class="tech-avatar" src="${esc(t.photo_url)}" alt="" loading="lazy" onerror="this.replaceWith(Object.assign(document.createElement('span'),{className:'tech-avatar tech-avatar--initials',textContent:'${esc(initials(display))}'}))">`
+    : `<span class="tech-avatar tech-avatar--initials">${esc(initials(display))}</span>`;
+  return `<span class="tech-cell">${avatar}<span class="tech-name">${esc(display)}</span></span>`;
+}
+
+/* initials from a Thai/English name — strip common Thai title prefixes */
+function initials(name) {
+  let n = String(name || '').trim();
+  n = n.replace(/^(นาย|นาง|นางสาว|น\.ส\.|ด\.ช\.|ด\.ญ\.|Mr\.?|Ms\.?|Mrs\.?)\s*/i, '');
+  const parts = n.split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return '?';
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+  return (parts[0][0] + parts[1][0]).toUpperCase();
 }
 
 function statusPill(status) {
@@ -763,26 +1392,53 @@ function getFallbackData() {
   ];
 
   // pm_plans.status enum: Pending / In Progress / Completed / Overdue / Cancelled
+  const pmTitles = ['ตรวจเช็คระดับน้ำมันไฮดรอลิก','ทำความสะอาดชุดทำความเย็น','หล่อลื่นแบริ่งมอเตอร์','ตรวจสอบเซ็นเซอร์ความดัน','ปรับตั้งสายพานลำเลียง','เปลี่ยนซีลกันรั่ว','ตรวจสภาพชุดแคลมป์','เช็คระบบลม'];
+  const pmTypes = ['Inspection','Cleaning','Lubrication','Condition Check','Adjustment','Replacement','Safety Check','Inspection'];
   const planStatuses = ['Completed','Completed','Completed','Completed','Completed','Completed','Completed','Completed','Completed','Completed','Completed','Completed','Completed','In Progress','In Progress','Pending','Pending','Pending','Overdue','Overdue'];
   const plans = planStatuses.map((st, i) => ({
     id: i + 1,
     pm_no: 'PM-' + String(i + 1).padStart(3, '0'),
     machine_no: machines[i % machines.length].machine_no,
     machine_name: machines[i % machines.length].machine_name,
-    planned_date: dayISO(i - 5),
-    next_due_date: dayISO(i - 5),
+    pm_title: pmTitles[i % pmTitles.length],
+    pm_type: pmTypes[i % pmTypes.length],
+    planned_date: dayISO(i - 12),
+    next_due_date: dayISO(i - 12),
     status: st
   }));
 
-  // pm_history.result enum + follow_up_required boolean
-  const history = Array.from({ length: 15 }, (_, i) => ({
-    id: i + 1,
-    pm_no: 'PM-' + String(i + 1).padStart(3, '0'),
-    actual_date: dayISO(i),
-    status: 'Completed',
-    result: i % 6 === 0 ? 'Abnormal Found' : 'Normal',
-    follow_up_required: i % 7 === 0
-  }));
+  // pm_history.result enum + follow_up_required boolean — include findings text
+  const findings = [
+    { result: 'Abnormal Found',  finding: 'พบรอยรั่วซึมที่ข้อต่อไฮดรอลิก',     action_taken: 'ขันแน่นชั่วคราว รอเปลี่ยนซีล' },
+    { result: 'Need Follow-up',  finding: 'เสียงดังผิดปกติที่แบริ่ง',           action_taken: 'หล่อลื่นเพิ่ม นัดตรวจซ้ำสัปดาห์หน้า' },
+    { result: 'Need Spare Part', finding: 'เซ็นเซอร์อ่านค่าคลาดเคลื่อน',         action_taken: 'สั่งเซ็นเซอร์ใหม่ รออะไหล่' },
+    { result: 'Temporary Fixed', finding: 'สายพานหย่อนเกินพิกัด',              action_taken: 'ปรับความตึงชั่วคราว' },
+    { result: 'Normal',          finding: '',                                  action_taken: '' }
+  ];
+  const history = Array.from({ length: 18 }, (_, i) => {
+    const f = findings[i % 5];
+    return {
+      id: i + 1,
+      pm_no: 'PM-' + String(i + 1).padStart(3, '0'),
+      actual_date: dayISO(i),
+      machine_no: machines[i % machines.length].machine_no,
+      machine_name: machines[i % machines.length].machine_name,
+      pm_title: pmTitles[i % pmTitles.length],
+      status: f.result === 'Normal' ? 'Completed' : 'Need Follow-up',
+      result: f.result,
+      finding: f.finding,
+      action_taken: f.action_taken,
+      technician_name: ['Somchai','Wichai','Anan'][i % 3],
+      follow_up_required: f.result === 'Need Follow-up'
+    };
+  });
 
-  return { logs, machines, plans, history };
+  // sample technicians (no photos by default → initials avatars in preview)
+  const technicians = [
+    { id: 't1', employee_code: 'MVR-001', full_name: 'Somchai', position: 'Technician', photo_url: null, is_active: true },
+    { id: 't2', employee_code: 'MVR-002', full_name: 'Wichai',  position: 'Technician', photo_url: null, is_active: true },
+    { id: 't3', employee_code: 'MVR-003', full_name: 'Anan',    position: 'Senior Tech', photo_url: null, is_active: true }
+  ];
+
+  return { logs, machines, plans, history, technicians };
 }
