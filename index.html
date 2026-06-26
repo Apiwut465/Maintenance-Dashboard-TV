@@ -10,6 +10,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2.2.0/dist/chartjs-plugin-datalabels.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 
   <link rel="stylesheet" href="style.css" />
@@ -122,19 +123,79 @@
           </article>
         </div>
 
-        <!-- two charts -->
-        <div class="panel">
+        <!-- middle row: big trend + availability gauge -->
+        <div class="panel ov-trend">
           <div class="panel__head"><h2>Downtime Trend</h2><span class="panel__sub">Daily loss time (min)</span></div>
           <div class="panel__body chart-holder">
             <canvas id="chartDowntimeTrend"></canvas>
             <div class="state-empty" data-empty hidden>No downtime recorded for this period.</div>
           </div>
         </div>
-        <div class="panel">
+        <div class="panel ov-gauge">
+          <div class="panel__head"><h2>Availability</h2><span class="panel__sub">ความพร้อมเดินเครื่อง</span></div>
+          <div class="panel__body gauge-body">
+            <div class="gauge" id="availGauge">
+              <svg viewBox="0 0 200 120">
+                <path class="gauge__track" d="M20 110 A 80 80 0 0 1 180 110" />
+                <path class="gauge__fill"  id="availGaugeFill" d="M20 110 A 80 80 0 0 1 180 110" />
+              </svg>
+              <div class="gauge__center">
+                <span class="gauge__val" id="availGaugeVal">--<small>%</small></span>
+                <span class="gauge__cap" id="availGaugeCap">Availability</span>
+              </div>
+            </div>
+            <div class="gauge__scale"><span>0%</span><span>50%</span><span>100%</span></div>
+          </div>
+        </div>
+
+        <!-- bottom row: breakdown donut + top5 bar + today snapshot -->
+        <div class="panel ov-breakdown">
           <div class="panel__head"><h2>Breakdown Type</h2><span class="panel__sub">Share by category</span></div>
           <div class="panel__body chart-holder">
             <canvas id="chartBreakdown"></canvas>
             <div class="state-empty" data-empty hidden>No breakdown type data.</div>
+          </div>
+        </div>
+        <div class="panel ov-top5">
+          <div class="panel__head"><h2>Top 5 Loss Machine</h2><span class="panel__sub">Ranked by downtime</span></div>
+          <div class="panel__body chart-holder">
+            <canvas id="chartTopLossMini"></canvas>
+            <div class="state-empty" data-empty hidden>No machine loss data.</div>
+          </div>
+        </div>
+        <div class="panel ov-snapshot">
+          <div class="panel__head"><h2>Today Snapshot</h2><span class="panel__sub">สรุปวันนี้</span></div>
+          <div class="panel__body snap-body">
+            <div class="snap-tile snap-tile--jobs">
+              <div class="snap-tile__icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.4l-6 6a2 2 0 1 0 2.8 2.8l6-6a4 4 0 0 0 5.4-5.4l-2.4 2.4-2.8-.4-.4-2.8z"/></svg>
+              </div>
+              <div class="snap-tile__text"><span class="snap-tile__num" id="snapJobs">--</span><span class="snap-tile__lbl">งานซ่อมวันนี้</span></div>
+            </div>
+            <div class="snap-tile snap-tile--closed">
+              <div class="snap-tile__icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.1V12a10 10 0 1 1-5.9-9.1"/><path d="M22 4 12 14.01l-3-3"/></svg>
+              </div>
+              <div class="snap-tile__text"><span class="snap-tile__num snap-tile__num--green" id="snapClosed">--</span><span class="snap-tile__lbl">ปิดงานแล้ว</span></div>
+            </div>
+            <div class="snap-tile snap-tile--open">
+              <div class="snap-tile__icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg>
+              </div>
+              <div class="snap-tile__text"><span class="snap-tile__num snap-tile__num--red" id="snapOpen">--</span><span class="snap-tile__lbl">ค้างอยู่</span></div>
+            </div>
+            <div class="snap-tile snap-tile--feature">
+              <div class="snap-tile__icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="m19 9-5 5-4-4-3 3"/></svg>
+              </div>
+              <div class="snap-tile__text">
+                <div class="snap-feature__main">
+                  <span class="snap-tile__num" id="snapMeanDt">--</span>
+                  <span class="snap-trend" id="snapMeanTrend"></span>
+                </div>
+                <span class="snap-tile__lbl">เวลาเสียเฉลี่ย/วัน (min)</span>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -145,7 +206,24 @@
     <section class="page" data-page="1">
       <div class="page__grid page__grid--analysis">
 
-        <div class="panel">
+        <!-- NEW: predictive breakdown risk -->
+        <div class="panel panel--risk">
+          <div class="panel__head">
+            <h2>Breakdown Risk Forecast</h2>
+            <span class="panel__sub">คาดการณ์เครื่องเสี่ยงเสีย — วิเคราะห์จากสถิติการซ่อม</span>
+            <div class="legend">
+              <span class="legend__item"><i class="dot dot--red"></i>High risk</span>
+              <span class="legend__item"><i class="dot dot--yellow"></i>Medium</span>
+              <span class="legend__item"><i class="dot dot--green"></i>Low</span>
+            </div>
+          </div>
+          <div class="panel__body">
+            <div class="risk-grid" id="riskGrid"></div>
+            <div class="state-empty" id="riskEmpty" hidden>ข้อมูลไม่พอสำหรับคาดการณ์ — ต้องมีประวัติซ่อมอย่างน้อย 2 ครั้งต่อเครื่อง</div>
+          </div>
+        </div>
+
+        <div class="panel panel--an-top5">
           <div class="panel__head"><h2>Top 5 Loss Machine</h2><span class="panel__sub">Ranked by downtime</span></div>
           <div class="panel__body chart-holder">
             <canvas id="chartTopLoss"></canvas>
@@ -153,7 +231,7 @@
           </div>
         </div>
 
-        <div class="panel">
+        <div class="panel panel--an-pareto">
           <div class="panel__head"><h2>Pareto — Cause</h2><span class="panel__sub">Frequency with cumulative %</span></div>
           <div class="panel__body chart-holder">
             <canvas id="chartPareto"></canvas>
@@ -161,12 +239,12 @@
           </div>
         </div>
 
-        <div class="panel panel--span2">
+        <div class="panel panel--an-machines">
           <div class="panel__head">
             <h2>Machine Cumulative Loss</h2>
-            <span class="panel__sub">downtime สะสม &amp; ซ่อมล่าสุดในช่วงนี้ — ไม่ใช่สถานะเรียลไทม์</span>
+            <span class="panel__sub">downtime สะสมในช่วงนี้</span>
             <div class="legend">
-              <span class="legend__item"><i class="dot dot--red"></i>High loss</span>
+              <span class="legend__item"><i class="dot dot--red"></i>High</span>
               <span class="legend__item"><i class="dot dot--yellow"></i>Medium</span>
               <span class="legend__item"><i class="dot dot--green"></i>Low</span>
             </div>
@@ -253,6 +331,24 @@
         </div>
 
         <!-- bottom: abnormal / follow-up findings -->
+        <!-- PM breakdown by type -->
+        <div class="panel panel--pmtype">
+          <div class="panel__head"><h2>PM by Type</h2><span class="panel__sub">แยกตามประเภทงาน</span></div>
+          <div class="panel__body chart-holder">
+            <canvas id="chartPmType"></canvas>
+            <div class="state-empty" data-empty hidden>No PM plan data.</div>
+          </div>
+        </div>
+
+        <!-- PM breakdown by frequency -->
+        <div class="panel panel--pmfreq">
+          <div class="panel__head"><h2>PM by Frequency</h2><span class="panel__sub">แยกตามรอบความถี่</span></div>
+          <div class="panel__body chart-holder">
+            <canvas id="chartPmFreq"></canvas>
+            <div class="state-empty" data-empty hidden>No PM plan data.</div>
+          </div>
+        </div>
+
         <div class="panel panel--pmfindings">
           <div class="panel__head">
             <h2>Findings &amp; Follow-up</h2>
@@ -274,6 +370,72 @@
       </div>
     </section>
 
+    <!-- ====== PAGE 5 — EXECUTIVE SUMMARY ====== -->
+    <section class="page" data-page="4">
+      <div class="page__grid page__grid--exec">
+
+        <!-- top: 4 executive KPI tiles -->
+        <div class="exec-kpis">
+          <div class="exec-kpi" id="execPmOntime">
+            <div class="exec-kpi__label">PM On-time</div>
+            <div class="exec-kpi__th">งานบำรุงตรงเวลา</div>
+            <div class="exec-kpi__value"><span data-val>--</span><span class="exec-kpi__unit">%</span></div>
+            <div class="exec-kpi__bar"><span data-bar></span></div>
+            <div class="exec-kpi__foot" data-foot>On-time of completed PM</div>
+          </div>
+          <div class="exec-kpi" id="execFtf">
+            <div class="exec-kpi__label">First-Time Fix</div>
+            <div class="exec-kpi__th">ซ่อมจบครั้งเดียว</div>
+            <div class="exec-kpi__value"><span data-val>--</span><span class="exec-kpi__unit">%</span></div>
+            <div class="exec-kpi__bar"><span data-bar></span></div>
+            <div class="exec-kpi__foot" data-foot>Fixed without repeat</div>
+          </div>
+          <div class="exec-kpi" id="execRepeat">
+            <div class="exec-kpi__label">Repeat Failure</div>
+            <div class="exec-kpi__th">เสียซ้ำปัญหาเดิม</div>
+            <div class="exec-kpi__value"><span data-val>--</span><span class="exec-kpi__unit">%</span></div>
+            <div class="exec-kpi__bar"><span data-bar></span></div>
+            <div class="exec-kpi__foot" data-foot>Same machine + problem</div>
+          </div>
+          <div class="exec-kpi" id="execRatio">
+            <div class="exec-kpi__label">Breakdown : PM</div>
+            <div class="exec-kpi__th">สัดส่วนเสีย ต่อ บำรุง</div>
+            <div class="exec-kpi__value exec-kpi__value--ratio"><span data-val>--</span></div>
+            <div class="exec-kpi__bar"><span data-bar></span></div>
+            <div class="exec-kpi__foot" data-foot>Reactive vs preventive</div>
+          </div>
+        </div>
+
+        <!-- bottom-left: Top Problems -->
+        <div class="panel exec-problems">
+          <div class="panel__head"><h2>Top Problems</h2><span class="panel__sub">ปัญหาที่พบบ่อยสุด</span></div>
+          <div class="panel__body">
+            <div class="rank-list" id="execProblems"></div>
+            <div class="state-empty" id="execProblemsEmpty" hidden>No problem data.</div>
+          </div>
+        </div>
+
+        <!-- bottom-right: Top Causes -->
+        <div class="panel exec-causes">
+          <div class="panel__head"><h2>Top Causes</h2><span class="panel__sub">สาเหตุที่พบบ่อยสุด</span></div>
+          <div class="panel__body">
+            <div class="rank-list" id="execCauses"></div>
+            <div class="state-empty" id="execCausesEmpty" hidden>No cause data.</div>
+          </div>
+        </div>
+
+        <!-- bottom-wide: workload by technician -->
+        <div class="panel exec-workload">
+          <div class="panel__head"><h2>Technician Workload</h2><span class="panel__sub">ภาระงานช่าง — จำนวนงาน &amp; เวลาซ่อมรวม</span></div>
+          <div class="panel__body">
+            <div class="rank-list rank-list--tech" id="execWorkload"></div>
+            <div class="state-empty" id="execWorkloadEmpty" hidden>No technician data.</div>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
   </main>
 
   <!-- ============ PAGE INDICATOR / CONTROLS ============ -->
@@ -287,6 +449,7 @@
       <button class="deck-dot" data-go="1"><span>Analysis</span></button>
       <button class="deck-dot" data-go="2"><span>Operations</span></button>
       <button class="deck-dot" data-go="3"><span>PM / TPM</span></button>
+      <button class="deck-dot" data-go="4"><span>Executive</span></button>
     </div>
     <div class="deck-progress" id="deckProgress"><span></span></div>
   </footer>
