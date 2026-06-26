@@ -6,12 +6,12 @@
    Replace the two values below with your project's URL and anon key.
    (Supabase dashboard → Project Settings → API)
    ============================================================ */
-
 const SUPABASE_URL      = 'https://crigkewtzvslkpmsufxk.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNyaWdrZXd0enZzbGtwbXN1ZnhrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg0MDc5OTQsImV4cCI6MjA5Mzk4Mzk5NH0.G13M84Qz7mjLXuCtdCHe07BpP7feeBwVD4c2K4czot4';
 
+
 /* ---- Tunable constants ---- */
-const REFRESH_MS        = 100000;            // auto refresh every 15s
+const REFRESH_MS        = 15000;            // auto refresh every 15s
 const DEFAULT_PLANNED_MIN = 26 * 24 * 60;   // fallback planned time = 26d x 24h x 60m
 
 /* MTTR thresholds (minutes) */
@@ -32,7 +32,7 @@ const charts = {};               // chart instances by id
 let usingFallback = false;
 
 /* deck (page rotation) state */
-const PAGE_COUNT = 4;
+const PAGE_COUNT = 5;
 const PAGE_MS = 15000;           // seconds each page stays on screen
 let currentPage = 0;
 let pageTimer = null;
@@ -451,11 +451,102 @@ function render(data) {
   buildTechIndex(data.technicians);          // name/code → photo lookup
   const kpis = computeKpis(data);
   renderKpiCards(kpis, data);
+  renderGauge(kpis.availability);
+  renderSnapshot(data);
   renderCharts(data);
   renderMachines(data.machines, data.logs);
+  renderRiskForecast(data.logs, data.machines);
   renderPm(data);
   renderLogs(data.logs);
+  renderExecutive(data);
 }
+
+/* Availability half-circle gauge */
+function renderGauge(avail) {
+  const fill = document.getElementById('availGaugeFill');
+  const valEl = document.getElementById('availGaugeVal');
+  const capEl = document.getElementById('availGaugeCap');
+  if (!fill) return;
+
+  const pct = Math.max(0, Math.min(100, avail || 0));
+  const LEN = Math.PI * 80;                  // arc length ≈ 251.3
+  fill.style.strokeDasharray = LEN;
+  fill.style.strokeDashoffset = LEN - (LEN * pct) / 100;
+
+  const color = pct >= 80 ? 'var(--green)' : (pct >= 70 ? 'var(--yellow)' : 'var(--red)');
+  fill.style.stroke = color;
+  valEl.style.color = color;
+  valEl.innerHTML = fmtNum(pct, 1) + '<small>%</small>';
+  capEl.textContent = pct >= 80 ? 'ดีเยี่ยม' : (pct >= 70 ? 'เฝ้าระวัง' : 'ต่ำกว่าเป้า');
+}
+
+/* Today snapshot tiles (always "today" regardless of period selector) */
+function renderSnapshot(data) {
+  const today = new Date().toISOString().slice(0, 10);
+  const todayLogs = (data.logs || []).filter(r => (r.repair_date || '').slice(0, 10) === today);
+
+  const jobs = todayLogs.length;
+  const closed = todayLogs.filter(r => isStatusDone(r.status)).length;
+  const open = jobs - closed;
+
+  setText('snapJobs', fmtNum(jobs));
+  setText('snapClosed', fmtNum(closed));
+  setText('snapOpen', fmtNum(open));
+
+  renderMeanDowntimePerDay(data.logs);
+}
+
+/* Mean Downtime per Day across the selected period, with a trend vs earlier half */
+function renderMeanDowntimePerDay(logs) {
+  const numEl = document.getElementById('snapMeanDt');
+  const trendEl = document.getElementById('snapMeanTrend');
+  if (!numEl) return;
+
+  // sum loss per day
+  const byDay = new Map();
+  (logs || []).forEach(r => {
+    const d = (r.repair_date || '').slice(0, 10);
+    if (!d) return;
+    byDay.set(d, (byDay.get(d) || 0) + lossOf(r));
+  });
+
+  const days = [...byDay.keys()].sort();
+  if (days.length === 0) {
+    numEl.textContent = '0';
+    if (trendEl) trendEl.textContent = '';
+    return;
+  }
+
+  const totalLoss = [...byDay.values()].reduce((s, v) => s + v, 0);
+  const mean = totalLoss / days.length;        // avg per active day
+  numEl.textContent = fmtNum(mean, 1);
+
+  // trend: mean of recent half vs older half
+  if (!trendEl) return;
+  if (days.length < 4) { trendEl.className = 'snap-trend is-flat'; trendEl.textContent = '—'; return; }
+
+  const mid = Math.floor(days.length / 2);
+  const olderDays = days.slice(0, mid);
+  const recentDays = days.slice(mid);
+  const olderMean = olderDays.reduce((s, d) => s + byDay.get(d), 0) / olderDays.length;
+  const recentMean = recentDays.reduce((s, d) => s + byDay.get(d), 0) / recentDays.length;
+
+  const diffPct = olderMean === 0 ? 0 : ((recentMean - olderMean) / olderMean) * 100;
+
+  if (Math.abs(diffPct) < 5) {
+    trendEl.className = 'snap-trend is-flat';
+    trendEl.innerHTML = `<span class="snap-trend__arrow">→</span> ทรงตัว`;
+  } else if (diffPct > 0) {
+    // downtime increased = worse
+    trendEl.className = 'snap-trend is-up';
+    trendEl.innerHTML = `<span class="snap-trend__arrow">▲</span> ${fmtNum(Math.abs(diffPct), 0)}% แย่ลง`;
+  } else {
+    // downtime decreased = better
+    trendEl.className = 'snap-trend is-down';
+    trendEl.innerHTML = `<span class="snap-trend__arrow">▼</span> ${fmtNum(Math.abs(diffPct), 0)}% ดีขึ้น`;
+  }
+}
+function setText(id, v) { const el = document.getElementById(id); if (el) el.textContent = v; }
 
 /* technician lookup — keyed by both full_name and employee_code */
 let techIndex = {};
@@ -532,11 +623,11 @@ function aggregateDowntimeByMachine(logs) {
   const map = new Map();
   logs.forEach(r => {
     const name = r.machine_name || r.machine_no || 'Unknown';
-    map.set(name, (map.get(name) || 0) + lossOf(r));
+    let m = map.get(name);
+    if (!m) { m = { name, no: r.machine_no || '', total: 0 }; map.set(name, m); }
+    m.total += lossOf(r);
   });
-  return [...map.entries()]
-    .map(([name, total]) => ({ name, total }))
-    .sort((a, b) => b.total - a.total);
+  return [...map.values()].sort((a, b) => b.total - a.total);
 }
 
 /* ============================================================
@@ -601,198 +692,12 @@ function accentColor() { return cssVar('--accent') || '#4f93d6'; }
 
 Chart.defaults.font.family = CHART_FONT;
 
-
-/* ------------------------------------------------------------
-   Always-visible chart labels
-   - Shows KPI values directly on charts, so TV/kiosk users do not need hover tooltips.
-   - No external ChartDataLabels plugin required.
-   ------------------------------------------------------------ */
-function isLightTheme() { return document.documentElement.getAttribute('data-theme') === 'light'; }
-function chartLabelTextColor()  { return isLightTheme() ? '#23324a' : '#eef3fb'; }
-function chartLabelBgColor()    { return isLightTheme() ? 'rgba(255, 255, 255, 0.92)' : 'rgba(24, 37, 57, 0.90)'; }
-function chartLabelBorderColor(){ return isLightTheme() ? 'rgba(24, 35, 58, 0.08)' : 'rgba(255, 255, 255, 0.08)'; }
-function chartLabelShadowColor(){ return isLightTheme() ? 'rgba(15, 23, 42, 0.10)' : 'rgba(0, 0, 0, 0.24)'; }
-
-function toLabelLines(value) {
-  if (Array.isArray(value)) return value.map(v => String(v));
-  return String(value).split('\n');
+/* datalabels plugin: register globally but OFF by default;
+   each chart opts in via options.plugins.datalabels */
+if (window.ChartDataLabels) {
+  Chart.register(window.ChartDataLabels);
+  Chart.defaults.set('plugins.datalabels', { display: false });
 }
-
-function drawRoundRect(ctx, x, y, w, h, r) {
-  const radius = Math.min(r, w / 2, h / 2);
-  ctx.beginPath();
-  ctx.moveTo(x + radius, y);
-  ctx.lineTo(x + w - radius, y);
-  ctx.quadraticCurveTo(x + w, y, x + w, y + radius);
-  ctx.lineTo(x + w, y + h - radius);
-  ctx.quadraticCurveTo(x + w, y + h, x + w - radius, y + h);
-  ctx.lineTo(x + radius, y + h);
-  ctx.quadraticCurveTo(x, y + h, x, y + h - radius);
-  ctx.lineTo(x, y + radius);
-  ctx.quadraticCurveTo(x, y, x + radius, y);
-  ctx.closePath();
-}
-
-function drawLabelBox(ctx, label, x, y, opt = {}) {
-  const lines = toLabelLines(label).filter(Boolean);
-  if (!lines.length) return;
-
-  const fontSize = opt.fontSize || 10.5;
-  const fontWeight = opt.fontWeight || 600;
-  const lineHeight = Math.round(fontSize * 1.16);
-  const padX = opt.paddingX ?? 7;
-  const padY = opt.paddingY ?? 3;
-  const radius = opt.radius ?? 8;
-  const align = opt.align || 'center';
-  const baseline = opt.baseline || 'middle';
-  const chartArea = opt.chartArea;
-
-  ctx.save();
-  ctx.font = `${fontWeight} ${fontSize}px Sarabun, sans-serif`;
-  const textW = Math.max(...lines.map(t => ctx.measureText(t).width));
-  const boxW = Math.ceil(textW + padX * 2);
-  const boxH = Math.ceil((lines.length * lineHeight) + padY * 2);
-
-  let left = align === 'left' ? x : align === 'right' ? x - boxW : x - boxW / 2;
-  let top  = baseline === 'top' ? y : baseline === 'bottom' ? y - boxH : y - boxH / 2;
-
-  // Keep labels inside the chart area, preventing cut-off at panel edges.
-  if (chartArea) {
-    const margin = 2;
-    left = Math.max(chartArea.left + margin, Math.min(left, chartArea.right - boxW - margin));
-    top  = Math.max(chartArea.top + margin,  Math.min(top,  chartArea.bottom - boxH - margin));
-  }
-
-  const plain = opt.plain !== false;
-
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillStyle = opt.color || chartLabelTextColor();
-
-  if (!plain) {
-    ctx.fillStyle = opt.backgroundColor || chartLabelBgColor();
-    ctx.strokeStyle = opt.borderColor || chartLabelBorderColor();
-    ctx.lineWidth = 1;
-    ctx.shadowColor = opt.shadowColor || chartLabelShadowColor();
-    ctx.shadowBlur = opt.shadowBlur ?? 10;
-    ctx.shadowOffsetX = 0;
-    ctx.shadowOffsetY = 2;
-    drawRoundRect(ctx, left, top, boxW, boxH, radius);
-    ctx.fill();
-    ctx.shadowColor = 'transparent';
-    ctx.shadowBlur = 0;
-    ctx.stroke();
-  }
-
-  lines.forEach((line, i) => {
-    const ty = top + padY + (i * lineHeight) + lineHeight / 2;
-    ctx.fillText(line, left + boxW / 2, ty);
-  });
-  ctx.restore();
-}
-
-function defaultChartLabelFormatter(value) {
-  const n = Number(value);
-  return Number.isFinite(n) ? fmtNum(n) : String(value ?? '');
-}
-
-function drawDoughnutValueLabels(chart, opts) {
-  const ctx = chart.ctx;
-  const dataset = chart.data.datasets[0] || {};
-  const values = (dataset.data || []).map(v => Number(v) || 0);
-  const total = values.reduce((s, n) => s + n, 0) || 1;
-  const meta = chart.getDatasetMeta(0);
-
-  meta.data.forEach((arc, index) => {
-    const value = values[index];
-    if (!value) return;
-
-    const p = arc.getProps(['x', 'y', 'startAngle', 'endAngle', 'innerRadius', 'outerRadius'], true);
-    const angle = (p.startAngle + p.endAngle) / 2;
-    const radius = p.innerRadius + ((p.outerRadius - p.innerRadius) * 0.56);
-    const x = p.x + Math.cos(angle) * radius;
-    const y = p.y + Math.sin(angle) * radius;
-    const label = opts.formatter
-      ? opts.formatter(value, { chart, dataset, datasetIndex: 0, dataIndex: index })
-      : `${fmtNum((value / total) * 100, 0)}%`;
-
-    drawLabelBox(ctx, label, x, y, {
-      chartArea: chart.chartArea,
-      fontSize: opts.fontSize || 11,
-      fontWeight: opts.fontWeight || 600,
-      color: opts.color,
-      paddingX: opts.paddingX ?? 6,
-      paddingY: opts.paddingY ?? 4,
-      radius: opts.radius ?? 7,
-      plain: opts.plain !== false
-    });
-  });
-}
-
-function labelPositionForElement(chart, element, dataset, dsType) {
-  const indexAxis = chart.options.indexAxis || 'x';
-  const pos = element.tooltipPosition ? element.tooltipPosition() : { x: element.x, y: element.y };
-
-  if (dsType === 'bar') {
-    if (indexAxis === 'y') {
-      return { x: element.x + 8, y: element.y, align: 'left', baseline: 'middle' };
-    }
-    return { x: element.x, y: element.y - 8, align: 'center', baseline: 'bottom' };
-  }
-
-  // line / point labels
-  return { x: pos.x, y: pos.y - 10, align: 'center', baseline: 'bottom' };
-}
-
-const CHART_VALUE_LABEL_PLUGIN = {
-  id: 'alwaysValueLabels',
-  afterDatasetsDraw(chart, args, pluginOptions) {
-    const opts = pluginOptions || {};
-    if (opts.enabled === false) return;
-
-    const chartType = chart.config.type;
-    if (chartType === 'doughnut' || chartType === 'pie') {
-      drawDoughnutValueLabels(chart, opts);
-      return;
-    }
-
-    const ctx = chart.ctx;
-    chart.data.datasets.forEach((dataset, datasetIndex) => {
-      const meta = chart.getDatasetMeta(datasetIndex);
-      if (!meta || meta.hidden) return;
-
-      const dsType = dataset.type || chartType;
-      const values = dataset.data || [];
-      meta.data.forEach((element, dataIndex) => {
-        const raw = values[dataIndex];
-        const value = Number(raw);
-        if (!Number.isFinite(value)) return;
-        if (opts.hideZero && value === 0) return;
-
-        const label = opts.formatter
-          ? opts.formatter(raw, { chart, dataset, datasetIndex, dataIndex })
-          : defaultChartLabelFormatter(raw);
-        if (!label) return;
-
-        const p = labelPositionForElement(chart, element, dataset, dsType);
-        drawLabelBox(ctx, label, p.x, p.y, {
-          chartArea: chart.chartArea,
-          align: p.align,
-          baseline: p.baseline,
-          fontSize: opts.fontSize || 11,
-          fontWeight: opts.fontWeight || 600,
-          color: opts.color,
-          paddingX: opts.paddingX ?? 6,
-          paddingY: opts.paddingY ?? 4,
-          radius: opts.radius ?? 6,
-          plain: opts.plain !== false
-        });
-      });
-    });
-  }
-};
-
-Chart.register(CHART_VALUE_LABEL_PLUGIN);
 
 /* re-apply theme colors to existing charts (called on theme switch) */
 function refreshChartTheme() {
@@ -813,6 +718,7 @@ function refreshChartTheme() {
 function renderCharts(data) {
   renderDowntimeTrend(data.logs);
   renderTopLoss(data.logs);
+  renderTopLossMini(data.logs);
   renderPareto(data.logs);
   renderBreakdown(data.logs);
 }
@@ -835,6 +741,12 @@ function renderDowntimeTrend(logs) {
   const values = labels.map(l => map.get(l));
   toggleEmpty('chartDowntimeTrend', labels.length === 0);
 
+  // identify key points: max, min, last
+  const maxIdx = values.indexOf(Math.max(...values));
+  const minIdx = values.indexOf(Math.min(...values));
+  const lastIdx = values.length - 1;
+  const keySet = new Set([maxIdx, minIdx, lastIdx]);
+
   drawChart('chartDowntimeTrend', {
     type: 'line',
     data: {
@@ -845,20 +757,39 @@ function renderDowntimeTrend(logs) {
         backgroundColor: cssVar('--accent-soft') || 'rgba(79,147,214,0.15)',
         fill: true,
         tension: 0.32,
-        pointRadius: 4,
-        pointHoverRadius: 5,
-        pointBackgroundColor: accentColor(),
+        pointRadius: (ctx) => keySet.has(ctx.dataIndex) ? 5 : 2.5,
+        pointBackgroundColor: (ctx) => {
+          if (ctx.dataIndex === maxIdx) return cssVar('--red') || '#e5604f';
+          if (ctx.dataIndex === minIdx) return cssVar('--green') || '#34c178';
+          return accentColor();
+        },
         borderWidth: 2
       }]
     },
-    options: baseLineOptions({
-      enabled: true,
-      formatter: value => fmtNum(value),
-      fontSize: 10.5,
-      fontWeight: 600,
-      hideZero: true
-    })
+    options: {
+      ...baseLineOptions(),
+      layout: { padding: { top: 22 } },     // room for labels above points
+      plugins: {
+        legend: { display: false },
+        datalabels: keyPointLabels(keySet, maxIdx, minIdx)
+      }
+    }
   });
+}
+
+/* datalabels config: show value only on key points (max/min/last) */
+function keyPointLabels(keySet, maxIdx, minIdx) {
+  return {
+    display: (ctx) => keySet.has(ctx.dataIndex),
+    align: 'top', anchor: 'end', offset: 4,
+    color: (ctx) => {
+      if (ctx.dataIndex === maxIdx) return cssVar('--red') || '#e5604f';
+      if (ctx.dataIndex === minIdx) return cssVar('--green') || '#34c178';
+      return cssVar('--text-mid') || '#aebcd2';
+    },
+    font: { size: 12, weight: 700 },
+    formatter: (v) => fmtNum(v)
+  };
 }
 
 /* Top 5 loss machine — horizontal bar */
@@ -869,7 +800,7 @@ function renderTopLoss(logs) {
   drawChart('chartTopLoss', {
     type: 'bar',
     data: {
-      labels: top.map(t => t.name),
+      labels: top.map(t => t.no || t.name),
       datasets: [{
         data: top.map(t => t.total),
         backgroundColor: accentColor(),
@@ -879,15 +810,55 @@ function renderTopLoss(logs) {
     },
     options: {
       indexAxis: 'y',
-      ...baseBarOptions({
-        enabled: true,
-        formatter: value => fmtNum(value),
-        fontSize: 10.5,
-        fontWeight: 600,
-        hideZero: true
-      })
+      ...baseBarOptions(),
+      layout: { padding: { right: 42 } },
+      plugins: {
+        legend: { display: false },
+        datalabels: barValueLabels('right')
+      }
     }
   });
+}
+
+/* Compact Top-5 for the Overview page */
+function renderTopLossMini(logs) {
+  const top = aggregateDowntimeByMachine(logs).slice(0, 5);
+  toggleEmpty('chartTopLossMini', top.length === 0);
+
+  drawChart('chartTopLossMini', {
+    type: 'bar',
+    data: {
+      labels: top.map(t => t.no || t.name),
+      datasets: [{
+        data: top.map(t => t.total),
+        backgroundColor: top.map((t, i) => i === 0
+          ? (cssVar('--red') || '#e5604f')
+          : accentColor()),
+        borderRadius: 5,
+        barThickness: 18
+      }]
+    },
+    options: {
+      indexAxis: 'y',
+      ...baseBarOptions(),
+      layout: { padding: { right: 44 } },
+      plugins: {
+        legend: { display: false },
+        datalabels: barValueLabels('right')
+      }
+    }
+  });
+}
+
+/* datalabels for horizontal bars — value at the end of each bar */
+function barValueLabels(align) {
+  return {
+    display: true,
+    anchor: 'end', align: align || 'end', offset: 2,
+    color: (ctx) => cssVar('--text-mid') || '#aebcd2',
+    font: { size: 11.5, weight: 700 },
+    formatter: (v) => fmtNum(v)
+  };
 }
 
 /* Pareto cause — bars + cumulative % line */
@@ -908,24 +879,17 @@ function renderPareto(logs) {
   const cumulative = counts.map(n => { run += n; return Math.round((run / total) * 100); });
 
   drawChart('chartPareto', {
-    type: 'bar',
     data: {
       labels,
       datasets: [
         { type: 'bar', data: counts, backgroundColor: '#3f6fa5', borderRadius: 5, order: 2,
           yAxisID: 'y' },
         { type: 'line', data: cumulative, borderColor: '#e6b54a', backgroundColor: '#e6b54a',
-          borderWidth: 2, pointRadius: 4, pointHoverRadius: 5, tension: 0.25, order: 1, yAxisID: 'y1' }
+          borderWidth: 2, pointRadius: 3, tension: 0.25, order: 1, yAxisID: 'y1' }
       ]
     },
     options: {
-      ...baseBarOptions({
-        enabled: true,
-        formatter: (value, ctx) => ctx.dataset.yAxisID === 'y1' ? `${fmtNum(value)}%` : fmtNum(value),
-        fontSize: 10,
-        fontWeight: 600,
-        hideZero: true
-      }),
+      ...baseBarOptions(),
       scales: {
         x: { grid: { display: false }, ticks: { color: tickColor(), font: { size: 10 } } },
         y: { beginAtZero: true, grid: { color: gridColor() }, ticks: { color: tickColor(), precision: 0 } },
@@ -958,22 +922,21 @@ function renderBreakdown(logs) {
     },
     options: {
       responsive: true, maintainAspectRatio: false,
-      cutout: '62%',
-      layout: { padding: 12 },
+      cutout: '60%',
       plugins: {
-        legend: { position: 'right', labels: { color: cssVar('--text-mid'), font: { size: 11 }, boxWidth: 12, padding: 10 } },
-        tooltip: { enabled: true },
-        alwaysValueLabels: {
-          enabled: true,
-          formatter: (value, ctx) => {
-            const data = ctx.chart.data.datasets[0].data.map(v => Number(v) || 0);
-            const total = data.reduce((s, n) => s + n, 0) || 1;
-            const pct = (Number(value) / total) * 100;
-            return `${fmtNum(pct, 0)}%`;
+        legend: { position: 'right', labels: { color: cssVar('--text-mid'), font: { size: 11 }, boxWidth: 12, padding: 8 } },
+        datalabels: {
+          display: (ctx) => {
+            // only label slices that are big enough to fit text
+            const total = ctx.dataset.data.reduce((s, n) => s + n, 0) || 1;
+            return (ctx.dataset.data[ctx.dataIndex] / total) >= 0.08;
           },
-          color: '#ffffff',
-          fontSize: 10,
-          fontWeight: 600
+          color: '#fff',
+          font: { size: 12, weight: 700 },
+          formatter: (v, ctx) => {
+            const total = ctx.dataset.data.reduce((s, n) => s + n, 0) || 1;
+            return Math.round((v / total) * 100) + '%';
+          }
         }
       }
     }
@@ -981,30 +944,20 @@ function renderBreakdown(logs) {
 }
 
 /* shared option builders */
-function baseLineOptions(labelOptions = { enabled: false }) {
+function baseLineOptions() {
   return {
     responsive: true, maintainAspectRatio: false,
-    layout: { padding: { top: 28, right: 22, bottom: 4, left: 4 } },
-    plugins: {
-      legend: { display: false },
-      tooltip: { enabled: true },
-      alwaysValueLabels: labelOptions
-    },
+    plugins: { legend: { display: false } },
     scales: {
       x: { grid: { display: false }, ticks: { color: tickColor(), font: { size: 10 }, maxRotation: 0, autoSkip: true } },
       y: { beginAtZero: true, grid: { color: gridColor() }, ticks: { color: tickColor() } }
     }
   };
 }
-function baseBarOptions(labelOptions = { enabled: false }) {
+function baseBarOptions() {
   return {
     responsive: true, maintainAspectRatio: false,
-    layout: { padding: { top: 24, right: 38, bottom: 4, left: 4 } },
-    plugins: {
-      legend: { display: false },
-      tooltip: { enabled: true },
-      alwaysValueLabels: labelOptions
-    },
+    plugins: { legend: { display: false } },
     scales: {
       x: { beginAtZero: true, grid: { color: gridColor() }, ticks: { color: tickColor() } },
       y: { grid: { display: false }, ticks: { color: tickColor(), font: { size: 11 } } }
@@ -1083,6 +1036,176 @@ function renderMachines(machines, logs) {
 }
 
 /* ============================================================
+   BREAKDOWN RISK FORECAST
+   Statistical risk scoring from repair history — no external AI.
+   Score 0-100 weighted from: frequency, MTBF-due, trend, severity.
+   ============================================================ */
+function renderRiskForecast(logs, machines) {
+  const grid = document.getElementById('riskGrid');
+  const empty = document.getElementById('riskEmpty');
+  if (!grid) return;
+
+  const risks = computeRiskScores(logs, machines);
+
+  if (risks.length === 0) {
+    grid.innerHTML = '';
+    empty.hidden = false;
+    return;
+  }
+  empty.hidden = true;
+
+  grid.innerHTML = risks.slice(0, 8).map(r => {
+    const cls = r.score >= 66 ? 'r-high' : (r.score >= 33 ? 'r-med' : 'r-low');
+    const dueCls = r.overdue ? ' is-due' : '';
+    const forecastTxt = r.overdue
+      ? `<b>เลยรอบคาดการณ์แล้ว</b> ${Math.abs(r.daysToNext)} วัน — ควรตรวจ`
+      : `คาดว่าเสียครั้งถัดไป <b>~${fmtShortDate(r.nextDate)}</b> (อีก ${r.daysToNext} วัน)`;
+
+    return `
+      <div class="risk-card ${cls}">
+        <div class="risk-card__top">
+          <div>
+            <div class="risk-card__machine">${esc(r.no || r.name)}</div>
+            <div class="risk-card__sub">${esc(r.name)} · ${esc(r.line || '—')}</div>
+          </div>
+          <div class="risk-score">
+            <span class="risk-score__num">${r.score}</span>
+            <span class="risk-score__lbl">Risk</span>
+          </div>
+        </div>
+        <div class="risk-bar"><span style="width:${r.score}%"></span></div>
+        <div class="risk-meta">
+          <span class="risk-meta__item">เสีย <b>${r.count}</b> ครั้ง</span>
+          <span class="risk-meta__item">MTBF <b>${fmtNum(r.mtbf)}</b> วัน</span>
+          <span class="risk-meta__item">ซ่อมล่าสุด <b>${esc(fmtShortDate(r.lastDate))}</b></span>
+        </div>
+        <div class="risk-forecast${dueCls}">${forecastTxt}</div>
+        <div class="risk-reason">${esc(r.reason)}</div>
+      </div>`;
+  }).join('');
+}
+
+/* Core scoring — returns machines ranked by risk (desc) */
+function computeRiskScores(logs, machines) {
+  // group logs per machine (need >= 2 to estimate an interval)
+  const byMachine = new Map();
+  (logs || []).forEach(r => {
+    const key = r.machine_no || r.machine_name;
+    if (!key) return;
+    let m = byMachine.get(key);
+    if (!m) {
+      m = { no: r.machine_no || '', name: r.machine_name || key, line: r.production_line || '',
+            dates: [], severities: [] };
+      byMachine.set(key, m);
+    }
+    const d = (r.repair_date || '').slice(0, 10);
+    if (d) m.dates.push(d);
+    if (r.severity) m.severities.push(String(r.severity).toLowerCase());
+  });
+
+  const now = new Date();
+  const results = [];
+  let maxCount = 1;
+  byMachine.forEach(m => { if (m.dates.length > maxCount) maxCount = m.dates.length; });
+
+  byMachine.forEach(m => {
+    if (m.dates.length < 2) return;            // not enough history to forecast
+    m.dates.sort();
+    const count = m.dates.length;
+
+    // --- MTBF in days: average gap between consecutive breakdowns ---
+    const gaps = [];
+    for (let i = 1; i < m.dates.length; i++) {
+      const g = daysBetween(m.dates[i - 1], m.dates[i]);
+      if (g > 0) gaps.push(g);
+    }
+    const mtbf = gaps.length ? gaps.reduce((s, g) => s + g, 0) / gaps.length : 30;
+
+    // --- days since last repair, and forecast next ---
+    const lastDate = m.dates[m.dates.length - 1];
+    const daysSince = daysBetween(lastDate, fmtDate(now));
+    const daysToNext = Math.round(mtbf - daysSince);
+    const overdue = daysToNext < 0;
+    const nextDate = addDays(lastDate, Math.round(mtbf));
+
+    // ===== Risk factors (each 0..1) =====
+    // 1) frequency relative to the most-failing machine
+    const fFreq = count / maxCount;
+
+    // 2) how close to / past its own MTBF cycle
+    const fDue = clamp01(daysSince / Math.max(mtbf, 1));
+
+    // 3) trend: are failures getting more frequent? (2nd half vs 1st half)
+    const fTrend = failureTrend(m.dates);
+
+    // 4) severity: share of high/critical past issues
+    const fSev = severityFactor(m.severities);
+
+    const score = Math.round(100 * clamp01(
+      0.35 * fFreq + 0.30 * fDue + 0.20 * fTrend + 0.15 * fSev
+    ));
+
+    results.push({
+      no: m.no, name: m.name, line: m.line,
+      count, mtbf: Math.round(mtbf), lastDate, daysToNext, overdue, nextDate,
+      score,
+      reason: buildRiskReason({ count, mtbf: Math.round(mtbf), daysSince, overdue, fTrend, fSev })
+    });
+  });
+
+  return results.sort((a, b) => b.score - a.score);
+}
+
+/* trend factor: compare failure rate in recent half vs older half */
+function failureTrend(sortedDates) {
+  if (sortedDates.length < 4) return 0.4;     // too few to judge → neutral-ish
+  const mid = Math.floor(sortedDates.length / 2);
+  const firstHalf = sortedDates.slice(0, mid);
+  const secondHalf = sortedDates.slice(mid);
+  const spanFirst = Math.max(1, daysBetween(firstHalf[0], firstHalf[firstHalf.length - 1]));
+  const spanSecond = Math.max(1, daysBetween(secondHalf[0], secondHalf[secondHalf.length - 1]));
+  const rateFirst = firstHalf.length / spanFirst;
+  const rateSecond = secondHalf.length / spanSecond;
+  if (rateFirst === 0) return 0.6;
+  const ratio = rateSecond / rateFirst;        // >1 means accelerating
+  return clamp01((ratio - 0.5) / 1.5);         // map ~0.5..2.0 → 0..1
+}
+
+/* severity factor: fraction of high/critical incidents */
+function severityFactor(sevs) {
+  if (!sevs.length) return 0.3;
+  const high = sevs.filter(s => s.includes('high') || s.includes('critical') || s.includes('สูง') || s.includes('วิกฤต')).length;
+  return clamp01(high / sevs.length);
+}
+
+/* human-readable reason string (Thai) */
+function buildRiskReason({ count, mtbf, daysSince, overdue, fTrend, fSev }) {
+  const bits = [];
+  if (overdue) bits.push('เลยรอบ MTBF แล้ว');
+  else if (daysSince >= mtbf * 0.75) bits.push('ใกล้ครบรอบ MTBF');
+  if (fTrend >= 0.6) bits.push('เสียถี่ขึ้นเรื่อยๆ');
+  if (count >= 5) bits.push(`เสียบ่อย (${count} ครั้ง)`);
+  if (fSev >= 0.5) bits.push('ความรุนแรงสูง');
+  if (bits.length === 0) bits.push(`รอบเสียเฉลี่ย ${mtbf} วัน ยังไม่ถึงกำหนด`);
+  return bits.join(' · ');
+}
+
+/* date helpers */
+function fmtDate(d) { return d.toISOString().slice(0, 10); }
+function daysBetween(a, b) {
+  const da = new Date(a), db = new Date(b);
+  if (isNaN(da) || isNaN(db)) return 0;
+  return Math.round((db - da) / 86400000);
+}
+function addDays(dateStr, n) {
+  const d = new Date(dateStr);
+  if (isNaN(d)) return dateStr;
+  d.setDate(d.getDate() + n);
+  return fmtDate(d);
+}
+function clamp01(v) { return Math.max(0, Math.min(1, v)); }
+
+/* ============================================================
    PM / TPM PROGRESS
    ============================================================ */
 function renderPm(data) {
@@ -1117,6 +1240,84 @@ function renderPm(data) {
 
   renderPmPlanTable(plans);
   renderPmFindingTable(hist);
+  renderPmTypeChart(plans);
+  renderPmFreqChart(plans);
+}
+
+/* PM plans grouped by pm_type — horizontal bar */
+function renderPmTypeChart(plans) {
+  const map = new Map();
+  (plans || []).forEach(p => {
+    const t = p.pm_type || 'Other';
+    map.set(t, (map.get(t) || 0) + 1);
+  });
+  const entries = [...map.entries()].sort((a, b) => b[1] - a[1]);
+  toggleEmpty('chartPmType', entries.length === 0);
+
+  drawChart('chartPmType', {
+    type: 'bar',
+    data: {
+      labels: entries.map(e => e[0]),
+      datasets: [{
+        data: entries.map(e => e[1]),
+        backgroundColor: accentColor(),
+        borderRadius: 5,
+        barThickness: 18
+      }]
+    },
+    options: {
+      indexAxis: 'y',
+      ...baseBarOptions(),
+      layout: { padding: { right: 34 } },
+      plugins: {
+        legend: { display: false },
+        datalabels: barValueLabels('right')
+      }
+    }
+  });
+}
+
+/* PM plans grouped by frequency — doughnut */
+function renderPmFreqChart(plans) {
+  // keep a sensible order if present
+  const order = ['Daily', 'Weekly', 'Monthly', 'Quarterly', 'Yearly', 'Shutdown', 'AI Suggested'];
+  const map = new Map();
+  (plans || []).forEach(p => {
+    const f = p.frequency || 'Other';
+    map.set(f, (map.get(f) || 0) + 1);
+  });
+  const labels = [...map.keys()].sort((a, b) => {
+    const ia = order.indexOf(a), ib = order.indexOf(b);
+    return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
+  });
+  const values = labels.map(l => map.get(l));
+  toggleEmpty('chartPmFreq', labels.length === 0);
+
+  const palette = ['#4f93d6', '#34c178', '#e6b54a', '#e5604f', '#8b7fd6', '#46b6c4', '#9aa7bd'];
+
+  drawChart('chartPmFreq', {
+    type: 'doughnut',
+    data: {
+      labels,
+      datasets: [{ data: values, backgroundColor: palette, borderColor: cssVar('--surface'), borderWidth: 2 }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      cutout: '58%',
+      plugins: {
+        legend: { position: 'right', labels: { color: cssVar('--text-mid'), font: { size: 11 }, boxWidth: 12, padding: 7 } },
+        datalabels: {
+          display: (ctx) => {
+            const total = ctx.dataset.data.reduce((s, n) => s + n, 0) || 1;
+            return (ctx.dataset.data[ctx.dataIndex] / total) >= 0.09;
+          },
+          color: '#fff',
+          font: { size: 11.5, weight: 700 },
+          formatter: (v) => fmtNum(v)
+        }
+      }
+    }
+  });
 }
 
 /* Upcoming & overdue PM plans — overdue first, then soonest due */
@@ -1298,6 +1499,175 @@ function statusPill(status) {
 }
 
 /* ============================================================
+   EXECUTIVE SUMMARY
+   Management-level KPIs computed from existing data.
+   ============================================================ */
+function renderExecutive(data) {
+  const logs = data.logs || [];
+  const plans = data.plans || [];
+  const hist = data.history || [];
+
+  // ---- PM On-time %: completed PM done on/before due date ----
+  const completedPm = hist.filter(h => h.status === 'Completed' || h.result === 'Completed' || h.result === 'Normal');
+  let onTime = 0, pmConsidered = 0;
+  completedPm.forEach(h => {
+    const plan = plans.find(p => p.pm_no === h.pm_no);
+    const due = (plan && (plan.next_due_date || plan.planned_date)) || h.next_due_date;
+    const done = h.actual_date;
+    if (due && done) {
+      pmConsidered++;
+      if (new Date(done) <= new Date(due)) onTime++;
+    }
+  });
+  const pmOntimePct = pmConsidered ? (onTime / pmConsidered) * 100 : (completedPm.length ? 100 : 0);
+  setExecKpi('execPmOntime', fmtNum(pmOntimePct, 1), bandHigher(pmOntimePct, 90, 75), pmOntimePct);
+
+  // ---- First-Time Fix %: jobs whose machine+problem did NOT recur within the period ----
+  const ftf = firstTimeFixRate(logs);
+  setExecKpi('execFtf', fmtNum(ftf, 1), bandHigher(ftf, 85, 70), ftf);
+
+  // ---- Repeat Failure %: share of breakdowns that are a repeat of same machine+problem ----
+  const repeat = repeatFailureRate(logs);
+  setExecKpi('execRepeat', fmtNum(repeat, 1), bandLower(repeat, 15, 30), repeat);
+
+  // ---- Breakdown : PM ratio ----
+  const bdCount = logs.length;
+  const pmCount = hist.length;
+  const ratio = pmCount ? bdCount / pmCount : (bdCount ? bdCount : 0);
+  const ratioEl = document.getElementById('execRatio');
+  if (ratioEl) {
+    ratioEl.querySelector('[data-val]').textContent = pmCount ? (fmtNum(ratio, 1) + ' : 1') : '—';
+    // lower ratio = more preventive = better. bar relative to a 3:1 worst-case.
+    const barPct = Math.min(100, (ratio / 3) * 100);
+    const cls = ratio <= 1 ? 'is-green' : (ratio <= 2 ? 'is-yellow' : 'is-red');
+    ratioEl.classList.remove('is-green', 'is-yellow', 'is-red');
+    ratioEl.classList.add(cls);
+    const bar = ratioEl.querySelector('[data-bar]'); if (bar) bar.style.width = barPct + '%';
+  }
+
+  // ---- Top problems / causes ----
+  renderRankList('execProblems', 'execProblemsEmpty', countBy(logs, 'problem_name'));
+  renderRankList('execCauses', 'execCausesEmpty', countBy(logs, 'cause_name'));
+
+  // ---- Technician workload ----
+  renderWorkload(logs);
+}
+
+function firstTimeFixRate(logs) {
+  if (logs.length === 0) return 0;
+  // a "fix" recurs if the same machine+problem appears again on a later date
+  const seen = new Map();   // key -> [dates]
+  logs.forEach(r => {
+    const key = (r.machine_no || r.machine_name || '') + '|' + (r.problem_name || '');
+    const d = (r.repair_date || '').slice(0, 10);
+    if (!seen.has(key)) seen.set(key, []);
+    seen.get(key).push(d);
+  });
+  let recurring = 0, total = 0;
+  seen.forEach(dates => {
+    total += dates.length;
+    if (dates.length > 1) recurring += dates.length;   // all occurrences of a recurring pair
+  });
+  // first-time-fix = jobs that did NOT belong to a recurring pair
+  const fixedFirst = total - recurring;
+  return total ? (fixedFirst / total) * 100 : 0;
+}
+
+function repeatFailureRate(logs) {
+  if (logs.length === 0) return 0;
+  const seen = new Map();
+  logs.forEach(r => {
+    const key = (r.machine_no || r.machine_name || '') + '|' + (r.problem_name || '');
+    seen.set(key, (seen.get(key) || 0) + 1);
+  });
+  let repeats = 0;
+  seen.forEach(n => { if (n > 1) repeats += (n - 1); });   // extra occurrences beyond first
+  return (repeats / logs.length) * 100;
+}
+
+function countBy(logs, field) {
+  const map = new Map();
+  logs.forEach(r => {
+    const v = r[field] || '—';
+    map.set(v, (map.get(v) || 0) + 1);
+  });
+  return [...map.entries()].map(([name, count]) => ({ name, count })).sort((a, b) => b.count - a.count);
+}
+
+function renderRankList(gridId, emptyId, items) {
+  const grid = document.getElementById(gridId);
+  const empty = document.getElementById(emptyId);
+  if (!grid) return;
+  if (!items || items.length === 0) { grid.innerHTML = ''; if (empty) empty.hidden = false; return; }
+  if (empty) empty.hidden = true;
+
+  const max = items[0].count || 1;
+  grid.innerHTML = items.slice(0, 5).map((it, i) => `
+    <div class="rank-item">
+      <span class="rank-item__no">${i + 1}</span>
+      <div class="rank-item__body">
+        <div class="rank-item__top">
+          <span class="rank-item__name" title="${esc(it.name)}">${esc(it.name)}</span>
+          <span class="rank-item__val">${fmtNum(it.count)} ครั้ง</span>
+        </div>
+        <div class="rank-item__track"><span style="width:${(it.count / max) * 100}%"></span></div>
+      </div>
+    </div>`).join('');
+}
+
+function renderWorkload(logs) {
+  const grid = document.getElementById('execWorkload');
+  const empty = document.getElementById('execWorkloadEmpty');
+  if (!grid) return;
+
+  const map = new Map();
+  logs.forEach(r => {
+    const name = r.technician_name;
+    if (!name) return;
+    let t = map.get(name);
+    if (!t) { t = { name, code: r.technician_code || '', jobs: 0, loss: 0 }; map.set(name, t); }
+    t.jobs += 1;
+    t.loss += lossOf(r);
+  });
+  const techs = [...map.values()].sort((a, b) => b.jobs - a.jobs);
+
+  if (techs.length === 0) { grid.innerHTML = ''; if (empty) empty.hidden = false; return; }
+  if (empty) empty.hidden = true;
+
+  const maxJobs = techs[0].jobs || 1;
+  grid.innerHTML = techs.slice(0, 6).map(t => {
+    const tech = findTech(t.name, t.code);
+    const avatar = (tech && tech.photo_url)
+      ? `<img class="rank-tech-avatar" src="${esc(tech.photo_url)}" alt="">`
+      : `<span class="rank-tech-avatar">${esc(initials(t.name))}</span>`;
+    return `
+      <div class="rank-item">
+        ${avatar}
+        <div class="rank-item__body">
+          <div class="rank-item__top">
+            <span class="rank-item__name" title="${esc(t.name)}">${esc(t.name)}</span>
+            <span class="rank-item__val">${fmtNum(t.jobs)} งาน · ${fmtNum(t.loss)} min</span>
+          </div>
+          <div class="rank-item__track"><span style="width:${(t.jobs / maxJobs) * 100}%"></span></div>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+/* exec KPI helpers */
+function setExecKpi(id, value, cls, barPct) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.classList.remove('is-green', 'is-yellow', 'is-red');
+  if (cls) el.classList.add(cls);
+  el.querySelector('[data-val]').textContent = value;
+  const bar = el.querySelector('[data-bar]');
+  if (bar) bar.style.width = Math.max(0, Math.min(100, barPct || 0)) + '%';
+}
+function bandHigher(v, green, yellow) { return v >= green ? 'is-green' : (v >= yellow ? 'is-yellow' : 'is-red'); }
+function bandLower(v, green, yellow) { return v <= green ? 'is-green' : (v <= yellow ? 'is-yellow' : 'is-red'); }
+
+/* ============================================================
    STATUS / META HELPERS
    ============================================================ */
 function setConnection(online, fallback) {
@@ -1391,9 +1761,33 @@ function getFallbackData() {
     { id: 10, repair_date: dayISO(4), shift: 'A', machine_name: 'Injection M-02',machine_no: 'INJ-02', area_point_name: 'Mold',      problem_name: 'Flash defect',   cause_name: 'Clamp force',      action_name: 'Adjust clamp',    loss_time_min: 47, technician_name: 'Somchai', severity: 'Medium', status: 'Closed', breakdown_type: 'Process' }
   ];
 
+  // extra history (older dates) so the risk forecast has enough per-machine data points.
+  // Press P-11 = frequent & accelerating & high severity → should rank highest risk.
+  const hist = [
+    ['PRS-11','Press P-11','Line B', 7, 'Mechanical','High'],   ['PRS-11','Press P-11','Line B', 11,'Mechanical','High'],
+    ['PRS-11','Press P-11','Line B', 16,'Mechanical','Critical'],['PRS-11','Press P-11','Line B', 23,'Mechanical','High'],
+    ['INJ-02','Injection M-02','Line A', 9,'Electrical','Medium'],['INJ-02','Injection M-02','Line A', 17,'Electrical','High'],
+    ['INJ-02','Injection M-02','Line A', 28,'Process','Medium'],
+    ['RBT-03','Robot R-03','Line C', 12,'Electrical','High'],   ['RBT-03','Robot R-03','Line C', 26,'Electrical','Medium'],
+    ['CNV-05','Conveyor C-05','Line B', 14,'Mechanical','Low'], ['CNV-05','Conveyor C-05','Line B', 27,'Mechanical','Low'],
+    ['PKG-08','Packer K-08','Line C', 18,'Electrical','Medium'],['PKG-08','Packer K-08','Line C', 33,'Electrical','Low'],
+    ['INJ-01','Injection M-01','Line A', 20,'Process','Low'],   ['INJ-01','Injection M-01','Line A', 40,'Process','Low']
+  ];
+  hist.forEach((h, i) => {
+    logs.push({
+      id: 100 + i, repair_date: dayISO(h[3]), shift: i % 2 ? 'A' : 'B',
+      machine_name: h[1], machine_no: h[0], production_line: h[2],
+      area_point_name: '—', problem_name: 'ความผิดปกติ', cause_name: 'สึกหรอตามอายุ',
+      action_name: 'ซ่อม/เปลี่ยน', loss_time_min: 30 + (i * 7) % 60,
+      technician_name: ['Somchai','Wichai','Anan'][i % 3],
+      severity: h[5], status: 'Closed', breakdown_type: h[4]
+    });
+  });
+
   // pm_plans.status enum: Pending / In Progress / Completed / Overdue / Cancelled
   const pmTitles = ['ตรวจเช็คระดับน้ำมันไฮดรอลิก','ทำความสะอาดชุดทำความเย็น','หล่อลื่นแบริ่งมอเตอร์','ตรวจสอบเซ็นเซอร์ความดัน','ปรับตั้งสายพานลำเลียง','เปลี่ยนซีลกันรั่ว','ตรวจสภาพชุดแคลมป์','เช็คระบบลม'];
   const pmTypes = ['Inspection','Cleaning','Lubrication','Condition Check','Adjustment','Replacement','Safety Check','Inspection'];
+  const pmFreqs = ['Monthly','Weekly','Monthly','Quarterly','Weekly','Yearly','Monthly','Daily'];
   const planStatuses = ['Completed','Completed','Completed','Completed','Completed','Completed','Completed','Completed','Completed','Completed','Completed','Completed','Completed','In Progress','In Progress','Pending','Pending','Pending','Overdue','Overdue'];
   const plans = planStatuses.map((st, i) => ({
     id: i + 1,
@@ -1402,6 +1796,7 @@ function getFallbackData() {
     machine_name: machines[i % machines.length].machine_name,
     pm_title: pmTitles[i % pmTitles.length],
     pm_type: pmTypes[i % pmTypes.length],
+    frequency: pmFreqs[i % pmFreqs.length],
     planned_date: dayISO(i - 12),
     next_due_date: dayISO(i - 12),
     status: st
